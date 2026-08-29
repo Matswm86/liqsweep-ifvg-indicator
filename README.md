@@ -14,7 +14,7 @@ Session-liquidity raid into inverted-FVG reversal (the DodgysDD-style liquidity-
 - Optional modules: equal highs/lows (EQH/EQL) as extra liquidity pools, higher-timeframe FVG overlay (5m / 15m / 1h / 4h / daily), session boxes, raid labels.
 - Signal timing validated on 60 days of real MNQ 1-minute data: the entry triangle prints on the inversion bar (enter next bar).
 
-**File:** [`LiqSweep_iFVG.pine`](LiqSweep_iFVG.pine). Paste into TradingView's Pine editor and apply to a 1-minute chart (the indicator warns on any other timeframe).
+**File:** [`LiqSweep_iFVG.pine`](LiqSweep_iFVG.pine). Paste into TradingView's Pine editor. Works on any timeframe; defaults were tuned and validated on MNQ 1-minute.
 
 ## Macro Dealing Range & Premium/Discount
 

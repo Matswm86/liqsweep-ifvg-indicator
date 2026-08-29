@@ -19,7 +19,7 @@ indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=500, max_label
 //
 // Signal timing was validated on 60 days of real MNQ 1-minute data:
 // the entry triangle prints on the inversion bar (enter next bar).
-// Chart: MNQ 1-minute.
+// Runs on any timeframe; defaults tuned on MNQ 1-minute.
 // =====================================================================
 
 grpS = "01. Sessions (America/New_York)"
@@ -64,7 +64,7 @@ showFvg = input.bool(true, "Show FVG boxes", group=grpF, tooltip="Draw every liv
 
 grpH = "04b. Higher-timeframe FVG confluence"
 htfFvgTf = input.string("15", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which higher timeframe's gaps to draw.")
-htfFvgShow = input.bool(true, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
+htfFvgShow = input.bool(false, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
 colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", group=grpH)
 grpC = "05. Colors"
 colNY = input.color(color.orange, "NY", inline="c", group=grpC, tooltip="Session box + level line colors per session type.")
@@ -539,9 +539,3 @@ plotshape(plotTrig == -1, "Signal short (enter next bar)", shape.triangledown, l
 plotshape(plotTrig == 1, "Signal long (enter next bar)", shape.triangleup, location.belowbar, color.green, size=size.small)
 bgcolor(armDir.size() > 0 ? color.new(color.yellow, 92) : na, title="Armed (raid happened, waiting for trigger)")
 
-// -- Timeframe guard (visual; designed and tested on MNQ 1-minute) --
-if barstate.islast and timeframe.in_seconds() != 60
-    label.new(bar_index, high, "WRONG TIMEFRAME - chart is " + timeframe.period +
-         ", this indicator is designed for the 1-minute chart.\nSwitch to 1m.",
-         style=label.style_label_down, color=color.new(color.red, 10),
-         textcolor=color.white, size=size.large)
