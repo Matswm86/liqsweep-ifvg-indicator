@@ -1,5 +1,5 @@
 //@version=6
-indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
 
 // =====================================================================
 // LiqSweep+iFVG - session-liquidity raid -> inverted-FVG reversal
@@ -49,9 +49,7 @@ grpQ = "02b. Equal highs / lows (EQH-EQL)"
 useEq   = input.bool(false, "Track equal highs / lows", group=grpQ, tooltip="A swing high is a bar whose high is the highest of the last three (1-left/1-right pivot); when a later bar comes back into a tolerance band around it, the pair is an Equal High (EQH). Same, mirrored, for lows (EQL). Follows the CantoLab 'EQ & RE' convention. Equal highs/lows are resting liquidity: a cluster of stops sits just beyond them.")
 eqTolPts = input.float(1.0, "Tolerance (points)", minval=0, step=0.25, group=grpQ, tooltip="How close a later touch must come to count as EQUAL, in POINTS. 1.0 pt = 4 MNQ ticks = the source script's default. A touch further than this beyond the swing BREAKS the point instead.")
 eqMinGap = input.int(3, "Minimum bars before an equal match", minval=1, group=grpQ, tooltip="Bars that must pass after the swing forms before a touch inside the band counts as equal. Sooner than that and the point is treated as broken (swept), never marked equal. Source default: 3.")
-eqPool  = input.bool(true, "EQH/EQL count as draw-on-liquidity pools", group=grpQ, tooltip="Live EQH/EQL levels join the pool set that the 'Require unswept draw' filter in group 03 searches. Confluence only: adds targets, never adds entries.\n\nIn a 1-year MNQ test this added a handful of trades and no measurable help; kept as a chart tool, off by default.")
 eqArm   = input.bool(false, "Raids of EQH/EQL also ARM", group=grpQ, tooltip="A take-out of an equal high/low beyond the tolerance arms a reversal exactly like a session-level raid does, so the same iFVG trigger can fire on it.\n\nIn a 1-year MNQ test this was catastrophic (825 trades, PF 0.74). Off for a reason; provided so the failure can be re-checked.")
-showEq  = input.bool(true, "Show EQH/EQL lines", group=grpQ, tooltip="Draw each live equal high/low as a line from the first swing to its latest touch, with an EQH/EQL label. Visual only.")
 colEq   = input.color(color.red, "EQH/EQL color", group=grpQ)
 
 grpF = "04. Fair Value Gaps"
@@ -182,20 +180,6 @@ else if not na(asHi)
     asHi := na
     asLo := na
 
-// ── EQH/EQL state (CantoLab spec; lifecycle runs further down) ─────
-var array<float> swHPx = array.new_float()   // pending swing highs
-var array<int>   swHI  = array.new_int()
-var array<float> swLPx = array.new_float()
-var array<int>   swLI  = array.new_int()
-var array<float> eqHPx = array.new_float()   // live equal highs
-var array<float> eqHExt = array.new_float()
-var array<line>  eqHLn = array.new<line>()
-var array<label> eqHLb = array.new<label>()
-var array<float> eqLPx = array.new_float()
-var array<float> eqLExt = array.new_float()
-var array<line>  eqLLn = array.new<line>()
-var array<label> eqLLb = array.new<label>()
-
 // ── Live FVGs with fill-death lifecycle ────────────────────────────
 var array<float> fvgTop = array.new_float()
 var array<float> fvgBot = array.new_float()
@@ -279,135 +263,131 @@ var array<float> armExt = array.new_float()
 var array<int>   armExp = array.new_int()
 var array<int>   armI0  = array.new_int()
 
-// ── EQH/EQL lifecycle: sweep -> equal-match -> new swing ───────────
-// Order matters: a bar that takes a level out cannot also register as equal.
+// ── EQH/EQL module (adapted from "Equal Highs and Lows with Relative
+// [CantoLab]" - same swing/equal/sweep semantics, bar_time drawings) ──
+type SwingPoint
+    float price      = na
+    int   time       = na
+    int   formBarIdx = na
+    bool  referenced = false
+
+type ActiveLine
+    line  ln         = na
+    label lb         = na
+    int   startTime  = na
+    float startPrice = na
+    int   endTime    = na
+    float endPrice   = na
+
+method isFarEnough(SwingPoint sp, int currentBarIdx, int minGap) =>
+    (currentBarIdx - sp.formBarIdx) > minGap
+
+method checkLevel(SwingPoint sp, float level, float tolerance, bool isHigh, int currentBarIdx, int minGap) =>
+    string state = "none"
+    if not sp.referenced
+        bool farEnough = sp.isFarEnough(currentBarIdx, minGap)
+        if isHigh
+            if level > sp.price + tolerance
+                state := "break"
+            else if farEnough and level <= sp.price + tolerance and level >= sp.price - tolerance
+                state := "equal"
+        else
+            if level < sp.price - tolerance
+                state := "break"
+            else if farEnough and level >= sp.price - tolerance and level <= sp.price + tolerance
+                state := "equal"
+        if state != "none"
+            sp.referenced := true
+    state
+
+method mergeOrCreate(ActiveLine[] arr, SwingPoint sp, int endTime, float endPrice, float tolerance, bool isHigh) =>
+    int matchIdx = -1
+    if arr.size() > 0
+        for i = 0 to arr.size() - 1
+            ActiveLine alx = arr.get(i)
+            if alx.endTime == sp.time and math.abs(alx.endPrice - sp.price) <= tolerance
+                matchIdx := i
+                break
+    if matchIdx == -1
+        ActiveLine alNew = ActiveLine.new()
+        alNew.ln := line.new(sp.time, sp.price, endTime, endPrice, xloc=xloc.bar_time, color=colEq, width=1)
+        alNew.startTime := sp.time
+        alNew.startPrice := sp.price
+        arr.push(alNew)
+        matchIdx := arr.size() - 1
+    ActiveLine al = arr.get(matchIdx)
+    al.endTime := endTime
+    al.endPrice := endPrice
+    line.set_x2(al.ln, endTime)
+    line.set_y2(al.ln, endPrice)
+    bool exact = al.startPrice == endPrice
+    string labelText = isHigh ? (exact ? "EQH" : "REH") : (exact ? "EQL" : "REL")
+    int midTime = int(math.round((al.startTime + endTime) / 2))
+    if na(al.lb)
+        al.lb := label.new(midTime, endPrice, labelText, xloc=xloc.bar_time,
+             style=isHigh ? label.style_label_down : label.style_label_up,
+             color=color.new(color.white, 100), textcolor=colEq, size=size.small)
+    if not na(al.lb)
+        al.lb.set_x(midTime)
+        al.lb.set_y(endPrice)
+        al.lb.set_text(labelText)
+
+method checkSweep(ActiveLine[] arr, float level, bool isHigh, float tolerance) =>
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            ActiveLine al = arr.get(i)
+            float extreme = isHigh ? math.max(al.startPrice, al.endPrice) : math.min(al.startPrice, al.endPrice)
+            bool swept = isHigh ? level > extreme + tolerance : level < extreme - tolerance
+            if swept
+                if eqArm
+                    armDir.push(isHigh ? -1 : 1)
+                    armLvl.push(extreme)
+                    armExt.push(level)
+                    armExp.push(time + retTtlMin * 60000)
+                    armI0.push(bar_index)
+                line.delete(al.ln)
+                if not na(al.lb)
+                    label.delete(al.lb)
+                arr.remove(i)
+
+var SwingPoint[] swingHighs  = array.new<SwingPoint>()
+var SwingPoint[] swingLows   = array.new<SwingPoint>()
+var ActiveLine[] activeHighs = array.new<ActiveLine>()
+var ActiveLine[] activeLows  = array.new<ActiveLine>()
+
+int hb3 = ta.highestbars(3)
+int lb3 = ta.lowestbars(3)
+
 if useEq
-    // 1. sweep: a level taken out beyond tolerance dies (and may ARM)
-    if eqHPx.size() > 0
-        for j = eqHPx.size() - 1 to 0
-            if high > eqHExt.get(j) + eqTolPts
-                if eqArm
-                    armDir.push(-1)
-                    armLvl.push(eqHPx.get(j))
-                    armExt.push(high)
-                    armExp.push(time + retTtlMin * 60000)
-                    armI0.push(bar_index)
-                line.delete(eqHLn.get(j))
-                label.delete(eqHLb.get(j))
-                eqHPx.remove(j)
-                eqHExt.remove(j)
-                eqHLn.remove(j)
-                eqHLb.remove(j)
-    if eqLPx.size() > 0
-        for j = eqLPx.size() - 1 to 0
-            if low < eqLExt.get(j) - eqTolPts
-                if eqArm
-                    armDir.push(1)
-                    armLvl.push(eqLPx.get(j))
-                    armExt.push(low)
-                    armExp.push(time + retTtlMin * 60000)
-                    armI0.push(bar_index)
-                line.delete(eqLLn.get(j))
-                label.delete(eqLLb.get(j))
-                eqLPx.remove(j)
-                eqLExt.remove(j)
-                eqLLn.remove(j)
-                eqLLb.remove(j)
-    // 2. equal-match: pending swings vs this bar (a matched or broken swing
-    //    is consumed either way, exactly like the source script)
-    if swHPx.size() > 0
-        for j = swHPx.size() - 1 to 0
-            float sp = swHPx.get(j)
-            bool consumed = false
-            if high > sp + eqTolPts
-                consumed := true
-            else if bar_index - swHI.get(j) > eqMinGap and high >= sp - eqTolPts
-                consumed := true
-                int m = -1
-                if eqHPx.size() > 0
-                    for k = 0 to eqHPx.size() - 1
-                        if math.abs(eqHPx.get(k) - sp) <= eqTolPts
-                            m := k
-                            break
-                if m == -1
-                    eqHPx.push(sp)
-                    eqHExt.push(math.max(sp, high))
-                    eqHLn.push(line.new(swHI.get(j), sp, bar_index, sp, color=showEq ? colEq : color.new(colEq, 100), width=1))
-                    eqHLb.push(showEq ? label.new(bar_index, sp, sp == high ? "EQH" : "REH", style=label.style_label_down, color=color.new(color.white, 100), textcolor=colEq, size=size.small) : label(na))
-                else
-                    eqHExt.set(m, math.max(eqHExt.get(m), high))
-                    line.set_x2(eqHLn.get(m), bar_index)
-            if consumed
-                swHPx.remove(j)
-                swHI.remove(j)
-    if swLPx.size() > 0
-        for j = swLPx.size() - 1 to 0
-            float spL = swLPx.get(j)
-            bool consumedL = false
-            if low < spL - eqTolPts
-                consumedL := true
-            else if bar_index - swLI.get(j) > eqMinGap and low <= spL + eqTolPts
-                consumedL := true
-                int mL = -1
-                if eqLPx.size() > 0
-                    for k = 0 to eqLPx.size() - 1
-                        if math.abs(eqLPx.get(k) - spL) <= eqTolPts
-                            mL := k
-                            break
-                if mL == -1
-                    eqLPx.push(spL)
-                    eqLExt.push(math.min(spL, low))
-                    eqLLn.push(line.new(swLI.get(j), spL, bar_index, spL, color=showEq ? colEq : color.new(colEq, 100), width=1))
-                    eqLLb.push(showEq ? label.new(bar_index, spL, spL == low ? "EQL" : "REL", style=label.style_label_up, color=color.new(color.white, 100), textcolor=colEq, size=size.small) : label(na))
-                else
-                    eqLExt.set(mL, math.min(eqLExt.get(mL), low))
-                    line.set_x2(eqLLn.get(mL), bar_index)
-            if consumedL
-                swLPx.remove(j)
-                swLI.remove(j)
-    // 3. new pivots: bar[1] is the highest/lowest of the last three
-    if bar_index > 2
-        if high[1] > high and high[1] >= high[2]
-            swHPx.push(high[1])
-            swHI.push(bar_index - 1)
-        if low[1] < low and low[1] <= low[2]
-            swLPx.push(low[1])
-            swLI.push(bar_index - 1)
-    if swHPx.size() > 200
-        swHPx.shift()
-        swHI.shift()
-    if swLPx.size() > 200
-        swLPx.shift()
-        swLI.shift()
-    // cap live EQ levels (oldest first) so the 500-drawing limit never bites
-    if eqHPx.size() > 30
-        line.delete(eqHLn.get(0))
-        label.delete(eqHLb.get(0))
-        eqHPx.shift()
-        eqHExt.shift()
-        eqHLn.shift()
-        eqHLb.shift()
-    if eqLPx.size() > 30
-        line.delete(eqLLn.get(0))
-        label.delete(eqLLb.get(0))
-        eqLPx.shift()
-        eqLExt.shift()
-        eqLLn.shift()
-        eqLLb.shift()
-    // keep live EQ lines stretched to the current bar. LAST BAR ONLY:
-    // doing this on every historical bar issued ~26 drawing mutations
-    // per bar (1.6M on a 60-day 1m chart), blowing TradingView's script
-    // execution budget - the study then dies and ALL output vanishes,
-    // sessions included. Same visual at the right edge, none of the cost.
-    if showEq and barstate.islast
-        if eqHLn.size() > 0
-            for j = 0 to eqHLn.size() - 1
-                line.set_x2(eqHLn.get(j), bar_index)
-                label.set_x(eqHLb.get(j), bar_index)
-        if eqLLn.size() > 0
-            for j = 0 to eqLLn.size() - 1
-                line.set_x2(eqLLn.get(j), bar_index)
-                label.set_x(eqLLb.get(j), bar_index)
+    float eqH1 = high[1]
+    float eqL1 = low[1]
+    int   eqT1 = time[1]
+    activeHighs.checkSweep(eqH1, true, eqTolPts)
+    activeLows.checkSweep(eqL1, false, eqTolPts)
+    int recentEQHIdx  = -1
+    int recentEQHTime = -1
+    if swingHighs.size() > 0
+        for i = 0 to swingHighs.size() - 1
+            SwingPoint sp = swingHighs.get(i)
+            if sp.checkLevel(eqH1, eqTolPts, true, bar_index, eqMinGap) == "equal" and sp.time > recentEQHTime
+                recentEQHTime := sp.time
+                recentEQHIdx  := i
+    int recentEQLIdx  = -1
+    int recentEQLTime = -1
+    if swingLows.size() > 0
+        for i = 0 to swingLows.size() - 1
+            SwingPoint spL = swingLows.get(i)
+            if spL.checkLevel(eqL1, eqTolPts, false, bar_index, eqMinGap) == "equal" and spL.time > recentEQLTime
+                recentEQLTime := spL.time
+                recentEQLIdx  := i
+    if hb3 == -1
+        swingHighs.push(SwingPoint.new(high[1], time[1], bar_index, false))
+    if lb3 == -1
+        swingLows.push(SwingPoint.new(low[1], time[1], bar_index, false))
+    if recentEQHIdx != -1
+        activeHighs.mergeOrCreate(swingHighs.get(recentEQHIdx), eqT1, eqH1, eqTolPts, true)
+    if recentEQLIdx != -1
+        activeLows.mergeOrCreate(swingLows.get(recentEQLIdx), eqT1, eqL1, eqTolPts, false)
 
 if lvLine.size() > 0
     for j = lvLine.size() - 1 to 0
