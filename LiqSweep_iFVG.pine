@@ -18,7 +18,7 @@ indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=500, max_label
 //   premium/discount dealing range merged from the standalone Macro
 //   Dealing Range indicator (group 05, on by default), and Williams-
 //   fractal swing-point marks (group 06, 10 periods, on by default).
-// Runs on any timeframe; every tuned number comes from MNQ 1-minute.
+// Runs on any timeframe; defaults are sized for MNQ on 1-minute.
 // ====================================================================
 
 grpS = "01. Sessions (America/New_York)"
@@ -28,7 +28,7 @@ useLO  = input.bool(true,  "London levels", inline="2", group=grpS, tooltip="Tra
 loSess = input.session("0300-1100", "",     inline="2", group=grpS)
 useAS  = input.bool(true,  "Asia levels",   inline="3", group=grpS, tooltip="Track the Asia session's high and low as liquidity levels. 20:00-01:00 crosses midnight; that is handled.")
 asSess = input.session("2000-0100", "",     inline="3", group=grpS)
-armNY = input.bool(true,  "NY raids arm",     inline="a1", group=grpS, tooltip="Which sessions' levels can ARM a reversal. This is SEPARATE from tracking above: a session stays tracked (its high/low still counts as a draw-on-liquidity pool) even when its raids do not arm.\n\nAll sessions arm by default. In 1-year MNQ tests, arming London/Asia raids measured PF 0.74-0.91; NY-level raids carried the edge.")
+armNY = input.bool(true,  "NY raids arm",     inline="a1", group=grpS, tooltip="Which sessions' levels can ARM a reversal. This is SEPARATE from tracking above: a session stays tracked (its high/low still counts as a draw-on-liquidity pool) even when its raids do not arm.\n\nAll sessions arm by default; narrow this to focus the signal on the session levels you care about.")
 armLO = input.bool(true,  "London raids arm", inline="a1", group=grpS)
 armAS = input.bool(true,  "Asia raids arm",   inline="a1", group=grpS)
 showBoxes = input.bool(true, "Show session boxes", group=grpS, tooltip="Shade each session as a box whose top/bottom grow with the session's high/low while it is running, then freeze. Colors follow the per-session color inputs below.")
@@ -49,7 +49,7 @@ grpQ = "02b. Equal highs / lows (EQH-EQL)"
 useEq   = input.bool(true, "Track equal highs / lows", group=grpQ, tooltip="Adapted from the public 'EQ & RE' concept (CantoLab). A swing high is a bar whose high is the highest of the last three (1-left/1-right pivot); when a later bar comes back into a tolerance band around it, the pair is an Equal High (EQH). Same, mirrored, for lows (EQL). Equal highs/lows are resting liquidity: a cluster of stops sits just beyond them.")
 eqTolPts = input.float(1.5, "Tolerance (points)", minval=0, step=0.25, group=grpQ, tooltip="How close a later touch must come to count as EQUAL, in POINTS. 1.0 pt = 4 MNQ ticks = the source script's default. A touch further than this beyond the swing BREAKS the point instead.")
 eqMinGap = input.int(3, "Minimum bars before an equal match", minval=1, group=grpQ, tooltip="Bars that must pass after the swing forms before a touch inside the band counts as equal. Sooner than that and the point is treated as broken (swept), never marked equal. Source default: 3.")
-eqArm   = input.bool(false, "Raids of EQH/EQL also ARM", group=grpQ, tooltip="A take-out of an equal high/low beyond the tolerance arms a reversal exactly like a session-level raid does, so the same iFVG trigger can fire on it.\n\nIn a 1-year MNQ 1-minute test this measured roughly 825 trades/yr at profit factor 0.74 - heavily unprofitable. OFF by default; provided for research only.")
+eqArm   = input.bool(false, "Raids of EQH/EQL also ARM", group=grpQ, tooltip="A take-out of an equal high/low beyond the tolerance arms a reversal exactly like a session-level raid does, so the same iFVG trigger can fire on it.\n\nOFF by default: equal highs/lows fire far more often than session levels, so expect a much noisier signal. Provided for research.")
 colEq   = input.color(color.red, "EQH/EQL color", group=grpQ)
 
 grpF = "04. Fair Value Gaps"
@@ -61,8 +61,8 @@ invExtBars = input.int(60, "Keep inverted gap visible N bars", minval=5, group=g
 showFvg = input.bool(false, "Show FVG boxes", group=grpF, tooltip="Draw every live gap that passes the size filter. Green = bullish gap (support until inverted), red = bearish. Filled gaps disappear.")
 
 grpH = "04b. Higher-timeframe FVG confluence"
-htfFvgOn = input.bool(false, "Require price inside a higher-TF FVG", group=grpH, tooltip="Location confluence: a signal only fires if price has traded inside a live higher-timeframe FVG at any point from the raid through the trigger.\n\nIn a 1-year MNQ 1-minute test this improved profit factor monotonically with gap timeframe (15m ~1.8, 1h ~2.0, vs ~1.24 unfiltered) while keeping 50-65 trades a year. Off by default so the unfiltered baseline is what you see first.")
-htfFvgTf = input.string("15", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which timeframe's gaps count. Higher = stronger filter and fewer trades. In a 1-year MNQ 1-minute test: 5m kept 65 trades a year at PF 1.54, 15m kept ~60 at PF 1.80, 60m kept 54 at PF 2.00.")
+htfFvgOn = input.bool(false, "Require price inside a higher-TF FVG", group=grpH, tooltip="Location confluence: a signal only fires if price has traded inside a live higher-timeframe FVG at any point from the raid through the trigger.\n\nHigher gap timeframes filter harder: fewer signals, each backed by stronger higher-timeframe context. Off by default so the unfiltered baseline is what you see first.")
+htfFvgTf = input.string("15", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which timeframe's gaps count. Higher = stronger filter and fewer signals.")
 htfFvgShow = input.bool(false, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
 colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", group=grpH)
 grpP = "05. Macro dealing range (premium/discount)"
@@ -138,7 +138,7 @@ f_newLevel(string tag, int side, float price, color col) =>
     if showLevels
         // replacement semantics: a new session's level retires still-live older
         // levels of the same tag beyond the configured live depth. liveDepth=1
-        // (default) = the backtested engine: newest untouched level only.
+        // (default) = strict replacement: newest untouched level only.
         if lvTag.size() > 0
             int liveCnt = 0
             for j = lvTag.size() - 1 to 0
@@ -233,7 +233,7 @@ if useIfvg
         f_addFvg(-1, low[2], high)
 
 // ── Higher-timeframe FVGs (location confluence, group 04b) ─────────
-// Same 3-bar gap the 1m engine uses, requested on the selected timeframe
+// Same 3-bar gap rule as the 1m gaps, requested on the selected timeframe
 // with lookahead_off so a gap only exists once its HTF bar has confirmed.
 var array<float> hzTop = array.new_float()
 var array<float> hzBot = array.new_float()
