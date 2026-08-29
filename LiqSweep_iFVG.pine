@@ -1,5 +1,5 @@
 //@version=6
-indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=250, max_labels_count=250, max_boxes_count=250)
+indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=500, max_labels_count=250, max_boxes_count=250)
 
 // =====================================================================
 // LiqSweep+iFVG - session-liquidity raid -> inverted-FVG reversal
@@ -17,8 +17,8 @@ indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=250, max_label
 //    must happen after the raid.
 // 4. Optional modules: EQH/EQL tracking (CantoLab "EQ & RE"
 //    structure) with optional raid-arming, a higher-timeframe FVG
-//    overlay, premium/discount dealing-range zones (group 06), and
-//    Williams-fractal swing-point marks (group 07).
+//    overlay, premium/discount dealing-range zones (group 05), and
+//    Williams-fractal swing-point marks (group 06).
 //
 // Signal timing was validated on 60 days of real MNQ 1-minute data:
 // the entry triangle prints on the inversion bar (enter next bar).
@@ -36,7 +36,7 @@ armNY = input.bool(true,  "NY raids arm",     inline="a1", group=grpS, tooltip="
 armLO = input.bool(true,  "London raids arm", inline="a1", group=grpS)
 armAS = input.bool(true,  "Asia raids arm",   inline="a1", group=grpS)
 showBoxes = input.bool(true, "Show session boxes", group=grpS, tooltip="Shade each session as a box whose top/bottom grow with the session's high/low while it is running, then freeze. Colors follow the per-session color inputs below.")
-maxDays   = input.int(3, "Keep drawings for N sessions per type", minval=1, group=grpS, tooltip="History depth. Older session boxes and level lines beyond this count are deleted per session type, keeping the chart readable and under TradingView's drawing limits.")
+maxDays   = input.int(30, "Keep drawings for N sessions per type", minval=1, group=grpS, tooltip="History depth. Older session boxes and level lines beyond this count are deleted per session type, keeping the chart readable and under TradingView's drawing limits.")
 
 grpL = "02. Levels (liquidity lines)"
 showLevels = input.bool(true, "Show level lines", group=grpL, tooltip="Each completed session leaves two horizontal lines: its high and its low. A line extends forward until its FIRST touch in ANY later session, then freezes with a label. Touched once = gone forever; it can never be a target again. A new session's level also replaces any still-live older level of the same type.")
@@ -49,8 +49,8 @@ retTtlMin = input.int(60, "Trigger window after raid (minutes)", minval=1, group
 entryWin  = input.session("0100-1500", "Active entry window (NY tz)", group=grpE, tooltip="Signals only fire inside this window. Default 01:00-15:00 New York. Levels and FVGs are tracked around the clock; only the ENTRY is gated.")
 
 grpQ = "02b. Equal highs / lows (EQH-EQL)"
-useEq   = input.bool(false, "Track equal highs / lows", group=grpQ, tooltip="A swing high is a bar whose high is the highest of the last three (1-left/1-right pivot); when a later bar comes back into a tolerance band around it, the pair is an Equal High (EQH). Same, mirrored, for lows (EQL). Follows the CantoLab 'EQ & RE' convention. Equal highs/lows are resting liquidity: a cluster of stops sits just beyond them.")
-eqTolPts = input.float(1.0, "Tolerance (points)", minval=0, step=0.25, group=grpQ, tooltip="How close a later touch must come to count as EQUAL, in POINTS. 1.0 pt = 4 MNQ ticks = the source script's default. A touch further than this beyond the swing BREAKS the point instead.")
+useEq   = input.bool(true, "Track equal highs / lows", group=grpQ, tooltip="A swing high is a bar whose high is the highest of the last three (1-left/1-right pivot); when a later bar comes back into a tolerance band around it, the pair is an Equal High (EQH). Same, mirrored, for lows (EQL). Follows the CantoLab 'EQ & RE' convention. Equal highs/lows are resting liquidity: a cluster of stops sits just beyond them.")
+eqTolPts = input.float(1.5, "Tolerance (points)", minval=0, step=0.25, group=grpQ, tooltip="How close a later touch must come to count as EQUAL, in POINTS. 1.0 pt = 4 MNQ ticks = the source script's default. A touch further than this beyond the swing BREAKS the point instead.")
 eqMinGap = input.int(3, "Minimum bars before an equal match", minval=1, group=grpQ, tooltip="Bars that must pass after the swing forms before a touch inside the band counts as equal. Sooner than that and the point is treated as broken (swept), never marked equal. Source default: 3.")
 eqArm   = input.bool(false, "Raids of EQH/EQL also ARM", group=grpQ, tooltip="A take-out of an equal high/low beyond the tolerance arms a reversal exactly like a session-level raid does, so the same iFVG trigger can fire on it.\n\nIn a 1-year MNQ test this was catastrophic (825 trades, PF 0.74). Off for a reason; provided so the failure can be re-checked.")
 colEq   = input.color(color.red, "EQH/EQL color", group=grpQ)
@@ -67,7 +67,19 @@ grpH = "04b. Higher-timeframe FVG confluence"
 htfFvgTf = input.string("15", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which higher timeframe's gaps to draw.")
 htfFvgShow = input.bool(false, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
 colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", group=grpH)
-grpC = "05. Colors"
+grpP = "05. Macro dealing range (premium/discount)"
+usePD      = input.bool(true, "Show premium/discount zones", group=grpP, tooltip="Shade the active dealing range: premium (upper half) and discount (lower half) around the equilibrium midpoint. The range is the highest high / lowest low over the lookback below. Judge entries against where price sits inside the range.")
+pdLookback = input.int(50, "Dealing range lookback (bars)", minval=2, group=grpP, tooltip="How many bars back the dealing range looks for its high and low.")
+colPdBear  = input.color(color.new(#a65c4f, 20), "Premium",  inline="pd", group=grpP)
+colPdBull  = input.color(color.new(#7f9a65, 20), "Discount", inline="pd", group=grpP)
+
+grpW = "06. Swing points (fractals)"
+useSwings = input.bool(true, "Mark swing points", group=grpW, tooltip="Williams-fractal swing marks: a high/low that is the extreme of N bars on each side. A mark is CONFIRMED N bars after the swing bar and is plotted back on it - it cannot appear in real time, by definition.")
+swingN    = input.int(10, "Periods (bars each side)", minval=1, group=grpW)
+colSwHi   = input.color(#009688, "High", inline="sw", group=grpW)
+colSwLo   = input.color(#F44336, "Low",  inline="sw", group=grpW)
+
+grpC = "07. Colors"
 colNY = input.color(color.orange, "NY", inline="c", group=grpC, tooltip="Session box + level line colors per session type.")
 colLO = input.color(color.blue, "London", inline="c", group=grpC)
 colAS = input.color(color.purple, "Asia", inline="c", group=grpC)
@@ -547,11 +559,6 @@ bgcolor(armDir.size() > 0 ? color.new(color.yellow, 92) : na, title="Armed (raid
 
 // ── Macro dealing range: premium/discount (merged from the standalone
 // "Macro Dealing Range & Premium/Discount" indicator) ────────────────
-grpP = "06. Macro dealing range (premium/discount)"
-usePD      = input.bool(true, "Show premium/discount zones", group=grpP, tooltip="Shade the active dealing range: premium (upper half) and discount (lower half) around the equilibrium midpoint. The range is the highest high / lowest low over the lookback below. Judge entries against where price sits inside the range.")
-pdLookback = input.int(50, "Dealing range lookback (bars)", minval=2, group=grpP, tooltip="How many bars back the dealing range looks for its high and low.")
-colPdBear  = input.color(color.new(#a65c4f, 20), "Premium",  inline="pd", group=grpP)
-colPdBull  = input.color(color.new(#7f9a65, 20), "Discount", inline="pd", group=grpP)
 
 float pdHigh = ta.highest(high, pdLookback)
 float pdLow  = ta.lowest(low, pdLookback)
@@ -564,11 +571,6 @@ fill(pPdHigh, pPdEq, color=color.new(colPdBear, 85), title="Premium Zone")
 fill(pPdEq, pPdLow, color=color.new(colPdBull, 85), title="Discount Zone")
 
 // ── Swing points (Williams fractals) ─────────────────────────────────
-grpW = "07. Swing points (fractals)"
-useSwings = input.bool(true, "Mark swing points", group=grpW, tooltip="Williams-fractal swing marks: a high/low that is the extreme of N bars on each side. A mark is CONFIRMED N bars after the swing bar and is plotted back on it - it cannot appear in real time, by definition.")
-swingN    = input.int(10, "Periods (bars each side)", minval=1, group=grpW)
-colSwHi   = input.color(#009688, "High", inline="sw", group=grpW)
-colSwLo   = input.color(#F44336, "Low",  inline="sw", group=grpW)
 
 float swPtHi = ta.pivothigh(swingN, swingN)
 float swPtLo = ta.pivotlow(swingN, swingN)
