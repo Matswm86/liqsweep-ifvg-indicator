@@ -1,12 +1,13 @@
 //@version=6
-indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=250, max_labels_count=250, max_boxes_count=250)
 
 // =====================================================================
 // LiqSweep+iFVG - session-liquidity raid -> inverted-FVG reversal
 // (the DodgysDD-style liquidity-sweep / iFVG model).
 //
 // 1. Each session's high and low (NY, London, Asia) is tracked as a
-//    liquidity level. A level dies on its first touch.
+//    liquidity level. A level dies on its first touch, and a new
+//    session's level replaces the previous one of the same type.
 // 2. A raid (take-out beyond the level by a buffer) ARMS a reversal in
 //    the opposite direction for a limited time window.
 // 3. Trigger: iFVG inversion - a Fair Value Gap gets BODY-closed
@@ -14,8 +15,9 @@ indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_bars_back=5000, max_lines_
 //    clears every live arm of that direction: one signal per reversal.
 //    A gap from BEFORE the sweep can invert; only the inversion itself
 //    must happen after the raid.
-// 4. Optional: equal highs/lows (EQH/EQL) as extra liquidity pools and
-//    a higher-timeframe FVG overlay for confluence.
+// 4. Optional modules: EQH/EQL tracking (CantoLab "EQ & RE"
+//    structure) with optional raid-arming, a higher-timeframe FVG
+//    overlay, and premium/discount dealing-range zones (group 06).
 //
 // Signal timing was validated on 60 days of real MNQ 1-minute data:
 // the entry triangle prints on the inversion bar (enter next bar).
@@ -36,7 +38,7 @@ showBoxes = input.bool(true, "Show session boxes", group=grpS, tooltip="Shade ea
 maxDays   = input.int(3, "Keep drawings for N sessions per type", minval=1, group=grpS, tooltip="History depth. Older session boxes and level lines beyond this count are deleted per session type, keeping the chart readable and under TradingView's drawing limits.")
 
 grpL = "02. Levels (liquidity lines)"
-showLevels = input.bool(true, "Show level lines", group=grpL, tooltip="Each completed session leaves two horizontal lines: its high and its low. A line extends forward until its FIRST touch in ANY later session, then freezes with a label. Touched once = gone forever; it can never be a target again.")
+showLevels = input.bool(true, "Show level lines", group=grpL, tooltip="Each completed session leaves two horizontal lines: its high and its low. A line extends forward until its FIRST touch in ANY later session, then freezes with a label. Touched once = gone forever; it can never be a target again. A new session's level also replaces any still-live older level of the same type.")
 showRaidLabels = input.bool(true, "Show RAID / hit labels", group=grpL, tooltip="'RAID <tag>' marks a take-out that armed the reversal (price traded beyond the level by at least the raid buffer). 'hit <tag>' marks a touch too shallow to arm; the level still dies.")
 
 grpE = "03. Raid + trigger"
@@ -226,7 +228,9 @@ f_htfGap() =>
     bool gs = high < low[2] and low[2] - high >= minFvgPts
     [gb, gs, gb ? low : gs ? low[2] : na, gb ? high[2] : gs ? high : na, time]
 
-[hgB, hgS, hgT, hgBm, hgTime] = request.security(syminfo.tickerid, htfFvgTf, f_htfGap(), lookahead=barmerge.lookahead_off)
+// when the overlay is off, request the chart TF instead - near-free, and
+// the htfFvgShow guard below already discards the values
+[hgB, hgS, hgT, hgBm, hgTime] = request.security(syminfo.tickerid, htfFvgShow ? htfFvgTf : timeframe.period, f_htfGap(), lookahead=barmerge.lookahead_off)
 
 if htfFvgShow and (hgB or hgS) and not na(hgT) and not na(hgBm) and hgTime != lastHzTime
     lastHzTime := hgTime
@@ -388,6 +392,27 @@ if useEq
         activeHighs.mergeOrCreate(swingHighs.get(recentEQHIdx), eqT1, eqH1, eqTolPts, true)
     if recentEQLIdx != -1
         activeLows.mergeOrCreate(swingLows.get(recentEQLIdx), eqT1, eqL1, eqTolPts, false)
+    // prune consumed swing points (behavior-neutral: checkLevel skips
+    // referenced ones anyway) and cap active EQ lines so the arrays
+    // and drawing count stay bounded on long histories
+    if swingHighs.size() > 0
+        for i = swingHighs.size() - 1 to 0
+            if swingHighs.get(i).referenced
+                swingHighs.remove(i)
+    if swingLows.size() > 0
+        for i = swingLows.size() - 1 to 0
+            if swingLows.get(i).referenced
+                swingLows.remove(i)
+    if activeHighs.size() > 100
+        ActiveLine oldEqH = activeHighs.get(0)
+        line.delete(oldEqH.ln)
+        label.delete(oldEqH.lb)
+        activeHighs.remove(0)
+    if activeLows.size() > 100
+        ActiveLine oldEqL = activeLows.get(0)
+        line.delete(oldEqL.ln)
+        label.delete(oldEqL.lb)
+        activeLows.remove(0)
 
 if lvLine.size() > 0
     for j = lvLine.size() - 1 to 0

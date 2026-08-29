@@ -8,13 +8,13 @@ Pine Script v6 indicators for intraday futures. Built and tested on MNQ (Micro E
 
 Session-liquidity raid into inverted-FVG reversal (the DodgysDD-style liquidity-sweep / iFVG model).
 
-- Tracks each session's high and low (New York, London, Asia) as liquidity levels; a level dies on its first touch.
+- Tracks each session's high and low (New York, London, Asia) as liquidity levels; a level dies on its first touch, and a new session's level replaces the previous one of the same type.
 - A raid beyond a tracked level (by a configurable buffer) arms a reversal in the opposite direction for a limited window.
 - Entry signal: a Fair Value Gap gets body-closed through its far edge against the raid direction (iFVG inversion). One inversion clears every live arm of that direction: one signal per reversal. A gap formed before the sweep can invert; only the inversion has to happen after the raid.
-- Optional modules: equal highs/lows (EQH/EQL) as extra liquidity pools, higher-timeframe FVG overlay (5m / 15m / 1h / 4h / daily), session boxes, raid labels, and the Macro Dealing Range premium/discount zones (the standalone indicator below, built in as a toggle).
+- Optional modules: equal highs/lows tracking (EQH/EQL, CantoLab "EQ & RE" structure) with optional raid-arming, a higher-timeframe FVG overlay (5m / 15m / 1h / 4h / daily), session boxes, raid labels, and the Macro Dealing Range premium/discount zones (the standalone indicator below, built in as a group 06 toggle, on by default).
 - Signal timing validated on 60 days of real MNQ 1-minute data: the entry triangle prints on the inversion bar (enter next bar).
 
-**File:** [`LiqSweep_iFVG.pine`](LiqSweep_iFVG.pine). Paste into TradingView's Pine editor. Works on any timeframe; defaults were tuned and validated on MNQ 1-minute.
+**File:** [`LiqSweep_iFVG.pine`](LiqSweep_iFVG.pine). Paste into TradingView's Pine editor. Works on any timeframe; defaults were tuned and validated on MNQ 1-minute. Signals print on the inversion bar (enter next bar).
 
 ## Macro Dealing Range & Premium/Discount
 
