@@ -64,6 +64,7 @@ invExtBars = input.int(60, "Keep inverted gap visible N bars", minval=5, group=g
 showFvg = input.bool(false, "Show FVG boxes", group=grpF, tooltip="Draw every live gap that passes the size filter. Green = bullish gap (support until inverted), red = bearish. Filled gaps disappear.")
 
 grpH = "04b. Higher-timeframe FVG confluence"
+htfFvgOn = input.bool(false, "Require price inside a higher-TF FVG", group=grpH, tooltip="Dodgy/Tempo-style confluence: a signal only fires if price has traded inside a live higher-timeframe FVG at any point from the raid through the trigger.\n\nIn a 1-year MNQ 1m test this improved profit factor monotonically with gap timeframe (15m ~1.8, 1h ~2.0, vs ~1.24 unfiltered) while keeping 50-65 trades a year. Off by default so the unfiltered baseline stays what you validated on the chart.")
 htfFvgTf = input.string("15", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which higher timeframe's gaps to draw.")
 htfFvgShow = input.bool(false, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
 colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", group=grpH)
@@ -243,9 +244,9 @@ f_htfGap() =>
 
 // when the overlay is off, request the chart TF instead - near-free, and
 // the htfFvgShow guard below already discards the values
-[hgB, hgS, hgT, hgBm, hgTime] = request.security(syminfo.tickerid, htfFvgShow ? htfFvgTf : timeframe.period, f_htfGap(), lookahead=barmerge.lookahead_off)
+[hgB, hgS, hgT, hgBm, hgTime] = request.security(syminfo.tickerid, (htfFvgOn or htfFvgShow) ? htfFvgTf : timeframe.period, f_htfGap(), lookahead=barmerge.lookahead_off)
 
-if htfFvgShow and (hgB or hgS) and not na(hgT) and not na(hgBm) and hgTime != lastHzTime
+if (htfFvgOn or htfFvgShow) and (hgB or hgS) and not na(hgT) and not na(hgBm) and hgTime != lastHzTime
     lastHzTime := hgTime
     hzTop.push(hgT)
     hzBot.push(hgBm)
@@ -273,12 +274,24 @@ if hzTop.size() > 0
         else if htfFvgShow and not na(hzBox.get(j))
             box.set_right(hzBox.get(j), bar_index + 1)
 
+// does this bar trade inside a live higher-TF gap? (confluence filter)
+f_inHtfZone() =>
+    bool found = false
+    if hzTop.size() > 0
+        for j = 0 to hzTop.size() - 1
+            if low <= hzTop.get(j) and high >= hzBot.get(j)
+                found := true
+                break
+    found
+bool inHtfGap = f_inHtfZone()
+
 // ── Arms ───────────────────────────────────────────────────────────
 var array<int>   armDir = array.new_int()
 var array<float> armLvl = array.new_float()
 var array<float> armExt = array.new_float()
 var array<int>   armExp = array.new_int()
 var array<int>   armI0  = array.new_int()
+var array<bool>  armQ   = array.new<bool>()
 
 // ── EQH/EQL module (adapted from "Equal Highs and Lows with Relative
 // [CantoLab]" - same swing/equal/sweep semantics, bar_time drawings) ──
@@ -362,6 +375,7 @@ method checkSweep(ActiveLine[] arr, float level, bool isHigh, float tolerance) =
                     armExt.push(level)
                     armExp.push(time + retTtlMin * 60000)
                     armI0.push(bar_index)
+                    armQ.push(inHtfGap)
                 line.delete(al.ln)
                 if not na(al.lb)
                     label.delete(al.lb)
@@ -452,6 +466,7 @@ if lvLine.size() > 0
                 armExt.push(isHigh ? high : low)
                 armExp.push(time + retTtlMin * 60000)
                 armI0.push(bar_index)
+                armQ.push(inHtfGap)
 
 // ── Trigger scan + FVG lifecycle ───────────────────────────────────
 // v1.6: expiry pass first, then ONE inversion scan per direction. A
@@ -466,8 +481,14 @@ f_fireDir(int d) =>
         for j = 0 to armDir.size() - 1
             if armDir.get(j) == d
                 newestI0 := math.max(newestI0, armI0.get(j))
+    bool qOk = not htfFvgOn
+    if not qOk and armDir.size() > 0
+        for j = 0 to armDir.size() - 1
+            if armDir.get(j) == d and armQ.get(j)
+                qOk := true
+                break
     int hitK = -1
-    if newestI0 >= 0
+    if newestI0 >= 0 and qOk
         if useIfvg
             if fvgTop.size() > 0
                 for k = fvgTop.size() - 1 to 0
@@ -497,6 +518,7 @@ f_dropDir(int d) =>
                 armExt.remove(j)
                 armExp.remove(j)
                 armI0.remove(j)
+                armQ.remove(j)
 
 plotTrig = 0
 if armDir.size() > 0
@@ -507,8 +529,13 @@ if armDir.size() > 0
             armExt.remove(j)
             armExp.remove(j)
             armI0.remove(j)
+            armQ.remove(j)
         else
             armExt.set(j, armDir.get(j) == -1 ? math.max(armExt.get(j), high) : math.min(armExt.get(j), low))
+
+if htfFvgOn and inHtfGap and armDir.size() > 0
+    for j = 0 to armDir.size() - 1
+        armQ.set(j, true)
 
 for s = 0 to 1
     int d = s == 0 ? -1 : 1
