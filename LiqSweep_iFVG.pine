@@ -519,3 +519,21 @@ plotshape(plotTrig == -1, "Signal short (enter next bar)", shape.triangledown, l
 plotshape(plotTrig == 1, "Signal long (enter next bar)", shape.triangleup, location.belowbar, color.green, size=size.small)
 bgcolor(armDir.size() > 0 ? color.new(color.yellow, 92) : na, title="Armed (raid happened, waiting for trigger)")
 
+// ── Macro dealing range: premium/discount (merged from the standalone
+// "Macro Dealing Range & Premium/Discount" indicator) ────────────────
+grpP = "06. Macro dealing range (premium/discount)"
+usePD      = input.bool(true, "Show premium/discount zones", group=grpP, tooltip="Shade the active dealing range: premium (upper half) and discount (lower half) around the equilibrium midpoint. The range is the highest high / lowest low over the lookback below. Judge entries against where price sits inside the range.")
+pdLookback = input.int(50, "Dealing range lookback (bars)", minval=2, group=grpP, tooltip="How many bars back the dealing range looks for its high and low.")
+colPdBear  = input.color(color.new(#a65c4f, 20), "Premium",  inline="pd", group=grpP)
+colPdBull  = input.color(color.new(#7f9a65, 20), "Discount", inline="pd", group=grpP)
+
+float pdHigh = ta.highest(high, pdLookback)
+float pdLow  = ta.lowest(low, pdLookback)
+float pdEq   = (pdHigh + pdLow) / 2
+
+pPdHigh = plot(usePD ? pdHigh : na, "Premium Top",     color.new(colPdBear, 50), style=plot.style_linebr)
+pPdEq   = plot(usePD ? pdEq   : na, "Equilibrium",     color.new(color.gray, 50), style=plot.style_linebr)
+pPdLow  = plot(usePD ? pdLow  : na, "Discount Bottom", color.new(colPdBull, 50), style=plot.style_linebr)
+fill(pPdHigh, pPdEq, color=color.new(colPdBear, 85), title="Premium Zone")
+fill(pPdEq, pPdLow, color=color.new(colPdBull, 85), title="Discount Zone")
+
