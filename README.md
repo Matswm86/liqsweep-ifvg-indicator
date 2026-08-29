@@ -1,6 +1,6 @@
 # TradingView Indicators
 
-Pine Script v6 indicators for intraday futures. Built and tested on MNQ (Micro E-mini Nasdaq-100), 1-minute timeframe.
+Pine Script v6 indicator for intraday futures. Built and tested on MNQ (Micro E-mini Nasdaq-100), 1-minute timeframe.
 
 ## LiqSweep+iFVG
 
@@ -15,14 +15,6 @@ Session-liquidity raid into inverted-FVG reversal.
 - Signal timing validated on 60 days of real MNQ 1-minute data: the entry triangle prints on the inversion bar (enter next bar).
 
 **File:** [`LiqSweep_iFVG.pine`](LiqSweep_iFVG.pine). Paste into TradingView's Pine editor. Works on any timeframe; defaults were tuned and validated on MNQ 1-minute. Signals print on the inversion bar (enter next bar).
-
-## Macro Dealing Range & Premium/Discount
-
-![Macro Dealing Range on MNQ 1m](assets/macro-dealing-range-mnq-1m.png)
-
-Shades the active dealing range's premium (upper) and discount (lower) halves directly on the chart, so every entry can be judged against where price sits inside the range. The range is the highest high / lowest low over a configurable lookback (default 50 bars) with the equilibrium line at its midpoint.
-
-**File:** [`Macro_Dealing_Range_Premium_Discount.pine`](Macro_Dealing_Range_Premium_Discount.pine). This file is licensed under [MPL 2.0](https://mozilla.org/MPL/2.0/) per its header.
 
 ## Disclaimer
 
