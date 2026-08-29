@@ -17,7 +17,8 @@ indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=250, max_label
 //    must happen after the raid.
 // 4. Optional modules: EQH/EQL tracking (CantoLab "EQ & RE"
 //    structure) with optional raid-arming, a higher-timeframe FVG
-//    overlay, and premium/discount dealing-range zones (group 06).
+//    overlay, premium/discount dealing-range zones (group 06), and
+//    Williams-fractal swing-point marks (group 07).
 //
 // Signal timing was validated on 60 days of real MNQ 1-minute data:
 // the entry triangle prints on the inversion bar (enter next bar).
