@@ -1,0 +1,547 @@
+//@version=6
+indicator("LiqSweep+iFVG", "LiqSweep+iFVG", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// =====================================================================
+// LiqSweep+iFVG - session-liquidity raid -> inverted-FVG reversal
+// (the DodgysDD-style liquidity-sweep / iFVG model).
+//
+// 1. Each session's high and low (NY, London, Asia) is tracked as a
+//    liquidity level. A level dies on its first touch.
+// 2. A raid (take-out beyond the level by a buffer) ARMS a reversal in
+//    the opposite direction for a limited time window.
+// 3. Trigger: iFVG inversion - a Fair Value Gap gets BODY-closed
+//    through its far edge in the reversal direction. One inversion
+//    clears every live arm of that direction: one signal per reversal.
+//    A gap from BEFORE the sweep can invert; only the inversion itself
+//    must happen after the raid.
+// 4. Optional: equal highs/lows (EQH/EQL) as extra liquidity pools and
+//    a higher-timeframe FVG overlay for confluence.
+//
+// Signal timing was validated on 60 days of real MNQ 1-minute data:
+// the entry triangle prints on the inversion bar (enter next bar).
+// Chart: MNQ 1-minute.
+// =====================================================================
+
+grpS = "01. Sessions (America/New_York)"
+useNY  = input.bool(true,  "NY levels",     inline="1", group=grpS, tooltip="Track the New York session's high and low as liquidity levels. The session window is set in the field to the right.")
+nySess = input.session("0930-1600", "",     inline="1", group=grpS)
+useLO  = input.bool(true,  "London levels", inline="2", group=grpS, tooltip="Track the London session's high and low as liquidity levels.")
+loSess = input.session("0300-1100", "",     inline="2", group=grpS)
+useAS  = input.bool(true,  "Asia levels",   inline="3", group=grpS, tooltip="Track the Asia session's high and low as liquidity levels. 20:00-01:00 crosses midnight; that is handled.")
+asSess = input.session("2000-0100", "",     inline="3", group=grpS)
+armNY = input.bool(true,  "NY raids arm",     inline="a1", group=grpS, tooltip="Which sessions' levels can ARM a reversal. This is SEPARATE from tracking above: a session stays tracked (its high/low still counts as a draw-on-liquidity pool) even when its raids do not arm.\n\nAll sessions arm by default. In 1-year MNQ tests, arming London/Asia raids measured PF 0.74-0.91; NY-level raids carried the edge.")
+armLO = input.bool(true,  "London raids arm", inline="a1", group=grpS)
+armAS = input.bool(true,  "Asia raids arm",   inline="a1", group=grpS)
+showBoxes = input.bool(true, "Show session boxes", group=grpS, tooltip="Shade each session as a box whose top/bottom grow with the session's high/low while it is running, then freeze. Colors follow the per-session color inputs below.")
+maxDays   = input.int(3, "Keep drawings for N sessions per type", minval=1, group=grpS, tooltip="History depth. Older session boxes and level lines beyond this count are deleted per session type, keeping the chart readable and under TradingView's drawing limits.")
+
+grpL = "02. Levels (liquidity lines)"
+showLevels = input.bool(true, "Show level lines", group=grpL, tooltip="Each completed session leaves two horizontal lines: its high and its low. A line extends forward until its FIRST touch in ANY later session, then freezes with a label. Touched once = gone forever; it can never be a target again.")
+showRaidLabels = input.bool(true, "Show RAID / hit labels", group=grpL, tooltip="'RAID <tag>' marks a take-out that armed the reversal (price traded beyond the level by at least the raid buffer). 'hit <tag>' marks a touch too shallow to arm; the level still dies.")
+
+grpE = "03. Raid + trigger"
+entryMode = input.string("iFVG inversion", "Trigger after a raid", options=["iFVG inversion", "Return through level"], group=grpE, tooltip="What converts an armed raid into an entry signal.\n\niFVG inversion: a Fair Value Gap from the raid leg gets BODY-closed through its far edge in the reversal direction (a wick through is rejection, not inversion) - the Dodgy rule.\n\nReturn through level: simpler variant - the bar closes back through the raided level itself.")
+sweepBufPts = input.float(0.25, "Min raid beyond level (points)", minval=0, step=0.25, group=grpE, tooltip="How far past the level price must trade for the take-out to count as a raid (arm), in POINTS (1.0 = 4 MNQ ticks).")
+retTtlMin = input.int(60, "Trigger window after raid (minutes)", minval=1, group=grpE, tooltip="How long an armed raid stays valid. If the trigger (inversion or return) has not happened within this window, the raid is abandoned - no trade.")
+entryWin  = input.session("0100-1500", "Active entry window (NY tz)", group=grpE, tooltip="Signals only fire inside this window. Default 01:00-15:00 New York. Levels and FVGs are tracked around the clock; only the ENTRY is gated.")
+
+grpQ = "02b. Equal highs / lows (EQH-EQL)"
+useEq   = input.bool(false, "Track equal highs / lows", group=grpQ, tooltip="A swing high is a bar whose high is the highest of the last three (1-left/1-right pivot); when a later bar comes back into a tolerance band around it, the pair is an Equal High (EQH). Same, mirrored, for lows (EQL). Follows the CantoLab 'EQ & RE' convention. Equal highs/lows are resting liquidity: a cluster of stops sits just beyond them.")
+eqTolPts = input.float(1.0, "Tolerance (points)", minval=0, step=0.25, group=grpQ, tooltip="How close a later touch must come to count as EQUAL, in POINTS. 1.0 pt = 4 MNQ ticks = the source script's default. A touch further than this beyond the swing BREAKS the point instead.")
+eqMinGap = input.int(3, "Minimum bars before an equal match", minval=1, group=grpQ, tooltip="Bars that must pass after the swing forms before a touch inside the band counts as equal. Sooner than that and the point is treated as broken (swept), never marked equal. Source default: 3.")
+eqPool  = input.bool(true, "EQH/EQL count as draw-on-liquidity pools", group=grpQ, tooltip="Live EQH/EQL levels join the pool set that the 'Require unswept draw' filter in group 03 searches. Confluence only: adds targets, never adds entries.\n\nIn a 1-year MNQ test this added a handful of trades and no measurable help; kept as a chart tool, off by default.")
+eqArm   = input.bool(false, "Raids of EQH/EQL also ARM", group=grpQ, tooltip="A take-out of an equal high/low beyond the tolerance arms a reversal exactly like a session-level raid does, so the same iFVG trigger can fire on it.\n\nIn a 1-year MNQ test this was catastrophic (825 trades, PF 0.74). Off for a reason; provided so the failure can be re-checked.")
+showEq  = input.bool(true, "Show EQH/EQL lines", group=grpQ, tooltip="Draw each live equal high/low as a line from the first swing to its latest touch, with an EQH/EQL label. Visual only.")
+colEq   = input.color(color.red, "EQH/EQL color", group=grpQ)
+
+grpF = "04. Fair Value Gaps"
+minFvgPts = input.float(1.0, "Minimum FVG size (points)", minval=0, step=0.25, group=grpF, tooltip="Gaps smaller than this are ignored entirely - not drawn, not usable for inversion. 1.0 point on MNQ = 4 ticks. Set 0 to keep every true 3-bar gap.\n\nTradeoff (measured on 60 days of real MNQ 1m): at 1.0 a sub-1pt gap can be the FIRST inversion, so the signal waits for the next bigger gap (median 9 bars late when it happens). 0 removes that lateness at the cost of chart noise.")
+fvgFillRule = input.string("Body close through", "FVG fill rule (gap death)", options=["Body close through", "Wick through"], group=grpF, tooltip="When a gap counts as FILLED and is deleted from chart and logic.\n\nBody close through: a candle body closes beyond the far edge (matches the model; a filled gap can no longer invert later).\n\nWick through: any wick beyond the far edge kills it (matches the common FVG indicators, stricter).\n\nNote: the INVERSION signal itself always requires a body close, regardless of this setting.")
+fvgLookback = input.int(30, "FVGs eligible from N bars before raid", minval=0, group=grpF, tooltip="Only gaps formed at most this many bars before the raid (or any time after it, while armed) can invert into a signal. Keeps the inversion tied to the raid leg instead of stale gaps from hours ago.")
+fvgExtBars = input.int(30, "Extend live gap boxes N bars", minval=5, group=grpF, tooltip="Visual only: how far unfilled gap boxes stretch to the right of their formation bar while alive.")
+invExtBars = input.int(60, "Keep inverted gap visible N bars", minval=5, group=grpF, tooltip="After an inversion fires, the flipped gap is recolored and kept on the chart this many bars so the retest into it is visible.")
+showFvg = input.bool(true, "Show FVG boxes", group=grpF, tooltip="Draw every live gap that passes the size filter. Green = bullish gap (support until inverted), red = bearish. Filled gaps disappear.")
+
+grpH = "04b. Higher-timeframe FVG confluence"
+htfFvgTf = input.string("15", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which higher timeframe's gaps to draw.")
+htfFvgShow = input.bool(true, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
+colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", group=grpH)
+grpC = "05. Colors"
+colNY = input.color(color.orange, "NY", inline="c", group=grpC, tooltip="Session box + level line colors per session type.")
+colLO = input.color(color.blue, "London", inline="c", group=grpC)
+colAS = input.color(color.purple, "Asia", inline="c", group=grpC)
+colBull = input.color(color.green, "Bull FVG", inline="c2", group=grpC, tooltip="Fill colors for live gap boxes and the inverted-gap highlight.")
+colBear = input.color(color.red, "Bear FVG", inline="c2", group=grpC)
+
+tzNY = "America/New_York"
+tick = syminfo.mintick
+useIfvg = entryMode == "iFVG inversion"
+bodyFill = fvgFillRule == "Body close through"
+
+inNY = useNY and not na(time(timeframe.period, nySess, tzNY))
+inLO = useLO and not na(time(timeframe.period, loSess, tzNY))
+inAS = useAS and not na(time(timeframe.period, asSess, tzNY))
+inWin = not na(time(timeframe.period, entryWin, tzNY))
+
+// ── Session boxes ──────────────────────────────────────────────────
+var array<box>    sbBox = array.new<box>()
+var array<string> sbTag = array.new<string>()
+
+f_newBox(string tag, color col) =>
+    if showBoxes
+        sbBox.push(box.new(time, high, time, low, xloc=xloc.bar_time,
+             border_color=color.new(col, 60), bgcolor=color.new(col, 88),
+             text=tag, text_color=color.new(col, 30), text_size=size.small,
+             text_halign=text.align_left, text_valign=text.align_top))
+        sbTag.push(tag)
+        int cnt = 0
+        for j = sbTag.size() - 1 to 0
+            if sbTag.get(j) == tag
+                cnt += 1
+                if cnt > maxDays
+                    box.delete(sbBox.get(j))
+                    sbBox.remove(j)
+                    sbTag.remove(j)
+                    break
+
+f_growBox(string tag) =>
+    if showBoxes and sbTag.size() > 0
+        for j = sbTag.size() - 1 to 0
+            if sbTag.get(j) == tag
+                box b = sbBox.get(j)
+                b.set_right(time)
+                b.set_top(math.max(b.get_top(), high))
+                b.set_bottom(math.min(b.get_bottom(), low))
+                break
+
+// ── Level lines ────────────────────────────────────────────────────
+var array<line>   lvLine = array.new<line>()
+var array<string> lvTag  = array.new<string>()
+var array<int>    lvSide = array.new<int>()
+var array<bool>   lvLive = array.new<bool>()
+
+f_newLevel(string tag, int side, float price, color col) =>
+    if showLevels
+        // replacement semantics: a new session's level retires any still-live
+        // older level of the same tag (matches the backtested engine)
+        if lvTag.size() > 0
+            for j = lvTag.size() - 1 to 0
+                if lvTag.get(j) == tag and lvLive.get(j)
+                    lvLive.set(j, false)
+        lvLine.push(line.new(time, price, time, price, xloc=xloc.bar_time, color=col, width=2))
+        lvTag.push(tag)
+        lvSide.push(side)
+        lvLive.push(true)
+        int cnt = 0
+        for j = lvTag.size() - 1 to 0
+            if lvTag.get(j) == tag
+                cnt += 1
+                if cnt > maxDays
+                    line.delete(lvLine.get(j))
+                    lvLine.remove(j)
+                    lvTag.remove(j)
+                    lvSide.remove(j)
+                    lvLive.remove(j)
+                    break
+
+var float nyHi = na, var float nyLo = na
+var float loHi = na, var float loLo = na
+var float asHi = na, var float asLo = na
+
+if inNY
+    if na(nyHi)
+        f_newBox("NY", colNY)
+    f_growBox("NY")
+    nyHi := na(nyHi) ? high : math.max(nyHi, high)
+    nyLo := na(nyLo) ? low : math.min(nyLo, low)
+else if not na(nyHi)
+    f_newLevel("NYH", 1, nyHi, colNY)
+    f_newLevel("NYL", -1, nyLo, colNY)
+    nyHi := na
+    nyLo := na
+if inLO
+    if na(loHi)
+        f_newBox("LONDON", colLO)
+    f_growBox("LONDON")
+    loHi := na(loHi) ? high : math.max(loHi, high)
+    loLo := na(loLo) ? low : math.min(loLo, low)
+else if not na(loHi)
+    f_newLevel("LOH", 1, loHi, colLO)
+    f_newLevel("LOL", -1, loLo, colLO)
+    loHi := na
+    loLo := na
+if inAS
+    if na(asHi)
+        f_newBox("ASIA", colAS)
+    f_growBox("ASIA")
+    asHi := na(asHi) ? high : math.max(asHi, high)
+    asLo := na(asLo) ? low : math.min(asLo, low)
+else if not na(asHi)
+    f_newLevel("ASH", 1, asHi, colAS)
+    f_newLevel("ASL", -1, asLo, colAS)
+    asHi := na
+    asLo := na
+
+// ── EQH/EQL state (CantoLab spec; lifecycle runs further down) ─────
+var array<float> swHPx = array.new_float()   // pending swing highs
+var array<int>   swHI  = array.new_int()
+var array<float> swLPx = array.new_float()
+var array<int>   swLI  = array.new_int()
+var array<float> eqHPx = array.new_float()   // live equal highs
+var array<float> eqHExt = array.new_float()
+var array<line>  eqHLn = array.new<line>()
+var array<label> eqHLb = array.new<label>()
+var array<float> eqLPx = array.new_float()
+var array<float> eqLExt = array.new_float()
+var array<line>  eqLLn = array.new<line>()
+var array<label> eqLLb = array.new<label>()
+
+// ── Live FVGs with fill-death lifecycle ────────────────────────────
+var array<float> fvgTop = array.new_float()
+var array<float> fvgBot = array.new_float()
+var array<int>   fvgIdx = array.new_int()
+var array<int>   fvgDir = array.new_int()      // 1 bull, -1 bear
+var array<box>   fvgBoxA = array.new<box>()
+var array<int>   fvgInvAt = array.new_int()    // -1 = live; else bar of inversion
+
+f_addFvg(int d, float top, float bot) =>
+    fvgTop.push(top)
+    fvgBot.push(bot)
+    fvgIdx.push(bar_index)
+    fvgDir.push(d)
+    fvgInvAt.push(-1)
+    color cc = d == 1 ? colBull : colBear
+    fvgBoxA.push(showFvg ? box.new(bar_index - 1, top, bar_index + fvgExtBars, bot,
+         border_color=color.new(cc, 70), bgcolor=color.new(cc, 88)) : box(na))
+    if fvgTop.size() > 150
+        box.delete(fvgBoxA.get(0))
+        fvgTop.shift()
+        fvgBot.shift()
+        fvgIdx.shift()
+        fvgDir.shift()
+        fvgInvAt.shift()
+        fvgBoxA.shift()
+
+if useIfvg
+    if low > high[2] and low - high[2] >= minFvgPts
+        f_addFvg(1, low, high[2])
+    if high < low[2] and low[2] - high >= minFvgPts
+        f_addFvg(-1, low[2], high)
+
+// ── Higher-timeframe FVGs (location confluence, group 04b) ─────────
+// Same 3-bar gap the 1m engine uses, requested on the selected timeframe
+// with lookahead_off so a gap only exists once its HTF bar has confirmed.
+var array<float> hzTop = array.new_float()
+var array<float> hzBot = array.new_float()
+var array<int>   hzDir = array.new_int()
+var array<box>   hzBox = array.new<box>()
+var int lastHzTime = 0
+
+f_htfGap() =>
+    bool gb = low > high[2] and low - high[2] >= minFvgPts
+    bool gs = high < low[2] and low[2] - high >= minFvgPts
+    [gb, gs, gb ? low : gs ? low[2] : na, gb ? high[2] : gs ? high : na, time]
+
+[hgB, hgS, hgT, hgBm, hgTime] = request.security(syminfo.tickerid, htfFvgTf, f_htfGap(), lookahead=barmerge.lookahead_off)
+
+if htfFvgShow and (hgB or hgS) and not na(hgT) and not na(hgBm) and hgTime != lastHzTime
+    lastHzTime := hgTime
+    hzTop.push(hgT)
+    hzBot.push(hgBm)
+    hzDir.push(hgB ? 1 : -1)
+    hzBox.push(htfFvgShow ? box.new(bar_index, hgT, bar_index + 1, hgBm, xloc=xloc.bar_index,
+         border_color=color.new(colHtfFvg, 60), bgcolor=color.new(colHtfFvg, 90),
+         text=(htfFvgTf == "240" ? "4h" : htfFvgTf == "D" ? "1D" : htfFvgTf + "m") + " FVG", text_color=color.new(colHtfFvg, 25), text_size=size.tiny) : box(na))
+    if hzTop.size() > 60
+        box.delete(hzBox.get(0))
+        hzTop.shift()
+        hzBot.shift()
+        hzDir.shift()
+        hzBox.shift()
+
+// gap death: a chart-bar body close beyond the far edge (same rule as 1m)
+if hzTop.size() > 0
+    for j = hzTop.size() - 1 to 0
+        bool deadH = hzDir.get(j) == 1 ? close < hzBot.get(j) : close > hzTop.get(j)
+        if deadH
+            box.delete(hzBox.get(j))
+            hzTop.remove(j)
+            hzBot.remove(j)
+            hzDir.remove(j)
+            hzBox.remove(j)
+        else if htfFvgShow and not na(hzBox.get(j))
+            box.set_right(hzBox.get(j), bar_index + 1)
+
+// ── Arms ───────────────────────────────────────────────────────────
+var array<int>   armDir = array.new_int()
+var array<float> armLvl = array.new_float()
+var array<float> armExt = array.new_float()
+var array<int>   armExp = array.new_int()
+var array<int>   armI0  = array.new_int()
+
+// ── EQH/EQL lifecycle: sweep -> equal-match -> new swing ───────────
+// Order matters: a bar that takes a level out cannot also register as equal.
+if useEq
+    // 1. sweep: a level taken out beyond tolerance dies (and may ARM)
+    if eqHPx.size() > 0
+        for j = eqHPx.size() - 1 to 0
+            if high > eqHExt.get(j) + eqTolPts
+                if eqArm
+                    armDir.push(-1)
+                    armLvl.push(eqHPx.get(j))
+                    armExt.push(high)
+                    armExp.push(time + retTtlMin * 60000)
+                    armI0.push(bar_index)
+                line.delete(eqHLn.get(j))
+                label.delete(eqHLb.get(j))
+                eqHPx.remove(j)
+                eqHExt.remove(j)
+                eqHLn.remove(j)
+                eqHLb.remove(j)
+    if eqLPx.size() > 0
+        for j = eqLPx.size() - 1 to 0
+            if low < eqLExt.get(j) - eqTolPts
+                if eqArm
+                    armDir.push(1)
+                    armLvl.push(eqLPx.get(j))
+                    armExt.push(low)
+                    armExp.push(time + retTtlMin * 60000)
+                    armI0.push(bar_index)
+                line.delete(eqLLn.get(j))
+                label.delete(eqLLb.get(j))
+                eqLPx.remove(j)
+                eqLExt.remove(j)
+                eqLLn.remove(j)
+                eqLLb.remove(j)
+    // 2. equal-match: pending swings vs this bar (a matched or broken swing
+    //    is consumed either way, exactly like the source script)
+    if swHPx.size() > 0
+        for j = swHPx.size() - 1 to 0
+            float sp = swHPx.get(j)
+            bool consumed = false
+            if high > sp + eqTolPts
+                consumed := true
+            else if bar_index - swHI.get(j) > eqMinGap and high >= sp - eqTolPts
+                consumed := true
+                int m = -1
+                if eqHPx.size() > 0
+                    for k = 0 to eqHPx.size() - 1
+                        if math.abs(eqHPx.get(k) - sp) <= eqTolPts
+                            m := k
+                            break
+                if m == -1
+                    eqHPx.push(sp)
+                    eqHExt.push(math.max(sp, high))
+                    eqHLn.push(line.new(swHI.get(j), sp, bar_index, sp, color=showEq ? colEq : color.new(colEq, 100), width=1))
+                    eqHLb.push(showEq ? label.new(bar_index, sp, sp == high ? "EQH" : "REH", style=label.style_label_down, color=color.new(color.white, 100), textcolor=colEq, size=size.small) : label(na))
+                else
+                    eqHExt.set(m, math.max(eqHExt.get(m), high))
+                    line.set_x2(eqHLn.get(m), bar_index)
+            if consumed
+                swHPx.remove(j)
+                swHI.remove(j)
+    if swLPx.size() > 0
+        for j = swLPx.size() - 1 to 0
+            float spL = swLPx.get(j)
+            bool consumedL = false
+            if low < spL - eqTolPts
+                consumedL := true
+            else if bar_index - swLI.get(j) > eqMinGap and low <= spL + eqTolPts
+                consumedL := true
+                int mL = -1
+                if eqLPx.size() > 0
+                    for k = 0 to eqLPx.size() - 1
+                        if math.abs(eqLPx.get(k) - spL) <= eqTolPts
+                            mL := k
+                            break
+                if mL == -1
+                    eqLPx.push(spL)
+                    eqLExt.push(math.min(spL, low))
+                    eqLLn.push(line.new(swLI.get(j), spL, bar_index, spL, color=showEq ? colEq : color.new(colEq, 100), width=1))
+                    eqLLb.push(showEq ? label.new(bar_index, spL, spL == low ? "EQL" : "REL", style=label.style_label_up, color=color.new(color.white, 100), textcolor=colEq, size=size.small) : label(na))
+                else
+                    eqLExt.set(mL, math.min(eqLExt.get(mL), low))
+                    line.set_x2(eqLLn.get(mL), bar_index)
+            if consumedL
+                swLPx.remove(j)
+                swLI.remove(j)
+    // 3. new pivots: bar[1] is the highest/lowest of the last three
+    if bar_index > 2
+        if high[1] > high and high[1] >= high[2]
+            swHPx.push(high[1])
+            swHI.push(bar_index - 1)
+        if low[1] < low and low[1] <= low[2]
+            swLPx.push(low[1])
+            swLI.push(bar_index - 1)
+    if swHPx.size() > 200
+        swHPx.shift()
+        swHI.shift()
+    if swLPx.size() > 200
+        swLPx.shift()
+        swLI.shift()
+    // cap live EQ levels (oldest first) so the 500-drawing limit never bites
+    if eqHPx.size() > 30
+        line.delete(eqHLn.get(0))
+        label.delete(eqHLb.get(0))
+        eqHPx.shift()
+        eqHExt.shift()
+        eqHLn.shift()
+        eqHLb.shift()
+    if eqLPx.size() > 30
+        line.delete(eqLLn.get(0))
+        label.delete(eqLLb.get(0))
+        eqLPx.shift()
+        eqLExt.shift()
+        eqLLn.shift()
+        eqLLb.shift()
+    // keep live EQ lines stretched to the current bar. LAST BAR ONLY:
+    // doing this on every historical bar issued ~26 drawing mutations
+    // per bar (1.6M on a 60-day 1m chart), blowing TradingView's script
+    // execution budget - the study then dies and ALL output vanishes,
+    // sessions included. Same visual at the right edge, none of the cost.
+    if showEq and barstate.islast
+        if eqHLn.size() > 0
+            for j = 0 to eqHLn.size() - 1
+                line.set_x2(eqHLn.get(j), bar_index)
+                label.set_x(eqHLb.get(j), bar_index)
+        if eqLLn.size() > 0
+            for j = 0 to eqLLn.size() - 1
+                line.set_x2(eqLLn.get(j), bar_index)
+                label.set_x(eqLLb.get(j), bar_index)
+
+if lvLine.size() > 0
+    for j = lvLine.size() - 1 to 0
+        if not lvLive.get(j)
+            continue
+        line ln = lvLine.get(j)
+        float price = ln.get_y1()
+        ln.set_x2(time)
+        bool isHigh = lvSide.get(j) == 1
+        bool touched = isHigh ? high >= price : low <= price
+        if touched
+            lvLive.set(j, false)
+            bool raided = isHigh ? high >= price + sweepBufPts : low <= price - sweepBufPts
+            string tg0 = lvTag.get(j)
+            bool armOk0 = str.startswith(tg0, "NY") ? armNY : str.startswith(tg0, "LO") ? armLO : armAS
+            if showRaidLabels
+                label.new(time, price, (raided ? (armOk0 ? "RAID " : "raid/no-arm ") : "hit ") + lvTag.get(j), xloc=xloc.bar_time,
+                     style=isHigh ? label.style_label_down : label.style_label_up,
+                     color=raided ? color.new(color.yellow, 20) : color.new(color.gray, 60),
+                     textcolor=color.black, size=size.small)
+            if raided and armOk0
+                armDir.push(isHigh ? -1 : 1)
+                armLvl.push(price)
+                armExt.push(isHigh ? high : low)
+                armExp.push(time + retTtlMin * 60000)
+                armI0.push(bar_index)
+
+// ── Trigger scan + FVG lifecycle ───────────────────────────────────
+// v1.6: expiry pass first, then ONE inversion scan per direction. A
+// single body-closed gap clears EVERY live arm of that direction (one
+// signal per reversal context). v1.1-1.5 gave each armed raid its own
+// per-arm scan and consumed one gap per arm, so stacked raids fired
+// their 2nd/3rd signal on later gaps — median 15 bars late on 60d MNQ.
+f_fireDir(int d) =>
+    // newest same-direction armI0 anchors the pre-raid lookback window
+    int newestI0 = -1
+    if armDir.size() > 0
+        for j = 0 to armDir.size() - 1
+            if armDir.get(j) == d
+                newestI0 := math.max(newestI0, armI0.get(j))
+    int hitK = -1
+    if newestI0 >= 0
+        if useIfvg
+            if fvgTop.size() > 0
+                for k = fvgTop.size() - 1 to 0
+                    if fvgInvAt.get(k) != -1
+                        continue
+                    if fvgIdx.get(k) < newestI0 - fvgLookback
+                        break
+                    if d == -1 and fvgDir.get(k) == 1 and close < fvgBot.get(k)
+                        hitK := k
+                        break
+                    if d == 1 and fvgDir.get(k) == -1 and close > fvgTop.get(k)
+                        hitK := k
+                        break
+        else
+            for j = 0 to armDir.size() - 1
+                if armDir.get(j) == d and (d == -1 ? close < armLvl.get(j) : close > armLvl.get(j))
+                    hitK := -2
+                    break
+    hitK
+
+f_dropDir(int d) =>
+    if armDir.size() > 0
+        for j = armDir.size() - 1 to 0
+            if armDir.get(j) == d
+                armDir.remove(j)
+                armLvl.remove(j)
+                armExt.remove(j)
+                armExp.remove(j)
+                armI0.remove(j)
+
+plotTrig = 0
+if armDir.size() > 0
+    for j = armDir.size() - 1 to 0
+        if time > armExp.get(j)
+            armDir.remove(j)
+            armLvl.remove(j)
+            armExt.remove(j)
+            armExp.remove(j)
+            armI0.remove(j)
+        else
+            armExt.set(j, armDir.get(j) == -1 ? math.max(armExt.get(j), high) : math.min(armExt.get(j), low))
+
+for s = 0 to 1
+    int d = s == 0 ? -1 : 1
+    int hitK = f_fireDir(d)
+    if hitK != -1
+        if hitK >= 0
+            fvgInvAt.set(hitK, bar_index)
+            box b = fvgBoxA.get(hitK)
+            if not na(b)
+                b.set_border_color(color.new(d == -1 ? colBear : colBull, 0))
+                b.set_bgcolor(color.new(d == -1 ? colBear : colBull, 80))
+                b.set_right(bar_index + invExtBars)
+        label.new(time, close, (useIfvg ? "iFVG " : "RTN ") + (d == -1 ? "SHORT" : "LONG") + (inWin ? "" : " (outside window)"),
+             xloc=xloc.bar_time, style=d == -1 ? label.style_label_down : label.style_label_up,
+             color=color.new(d == -1 ? colBear : colBull, 10), textcolor=color.white, size=size.small)
+        f_dropDir(d)
+        if inWin
+            plotTrig := d
+
+// filled gaps die: delete box + remove from logic (inversion above already ran)
+if fvgTop.size() > 0
+    for k = fvgTop.size() - 1 to 0
+        int inv = fvgInvAt.get(k)
+        bool dead = false
+        if inv != -1
+            dead := bar_index > inv + invExtBars
+        else
+            if fvgIdx.get(k) < bar_index
+                if fvgDir.get(k) == 1
+                    dead := bodyFill ? close < fvgBot.get(k) : low < fvgBot.get(k)
+                else
+                    dead := bodyFill ? close > fvgTop.get(k) : high > fvgTop.get(k)
+                if not dead and na(fvgBoxA.get(k)) == false and bar_index <= fvgIdx.get(k) + fvgExtBars
+                    box b2 = fvgBoxA.get(k)
+                    b2.set_right(bar_index + 1)
+        if dead
+            box.delete(fvgBoxA.get(k))
+            fvgTop.remove(k)
+            fvgBot.remove(k)
+            fvgIdx.remove(k)
+            fvgDir.remove(k)
+            fvgInvAt.remove(k)
+            fvgBoxA.remove(k)
+
+plotshape(plotTrig == -1, "Signal short (enter next bar)", shape.triangledown, location.abovebar, color.red, size=size.small)
+plotshape(plotTrig == 1, "Signal long (enter next bar)", shape.triangleup, location.belowbar, color.green, size=size.small)
+bgcolor(armDir.size() > 0 ? color.new(color.yellow, 92) : na, title="Armed (raid happened, waiting for trigger)")
+
+// -- Timeframe guard (visual; designed and tested on MNQ 1-minute) --
+if barstate.islast and timeframe.in_seconds() != 60
+    label.new(bar_index, high, "WRONG TIMEFRAME - chart is " + timeframe.period +
+         ", this indicator is designed for the 1-minute chart.\nSwitch to 1m.",
+         style=label.style_label_down, color=color.new(color.red, 10),
+         textcolor=color.white, size=size.large)
