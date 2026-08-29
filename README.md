@@ -20,9 +20,9 @@ Session-liquidity raid into inverted-FVG reversal (the DodgysDD-style liquidity-
 
 ![Macro Dealing Range on MNQ 1m](assets/macro-dealing-range-mnq-1m.png)
 
-Shades the active dealing range's premium (upper) and discount (lower) halves directly on the chart, so every entry can be judged against where price sits inside the range.
+Shades the active dealing range's premium (upper) and discount (lower) halves directly on the chart, so every entry can be judged against where price sits inside the range. The range is the highest high / lowest low over a configurable lookback (default 50 bars) with the equilibrium line at its midpoint.
 
-**File:** source is being prepared for release and lands here shortly.
+**File:** [`Macro_Dealing_Range_Premium_Discount.pine`](Macro_Dealing_Range_Premium_Discount.pine). This file is licensed under [MPL 2.0](https://mozilla.org/MPL/2.0/) per its header.
 
 ## Disclaimer
 
