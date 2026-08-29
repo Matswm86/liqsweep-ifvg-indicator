@@ -562,3 +562,15 @@ pPdLow  = plot(usePD ? pdLow  : na, "Discount Bottom", color.new(colPdBull, 50),
 fill(pPdHigh, pPdEq, color=color.new(colPdBear, 85), title="Premium Zone")
 fill(pPdEq, pPdLow, color=color.new(colPdBull, 85), title="Discount Zone")
 
+// ── Swing points (Williams fractals) ─────────────────────────────────
+grpW = "07. Swing points (fractals)"
+useSwings = input.bool(true, "Mark swing points", group=grpW, tooltip="Williams-fractal swing marks: a high/low that is the extreme of N bars on each side. A mark is CONFIRMED N bars after the swing bar and is plotted back on it - it cannot appear in real time, by definition.")
+swingN    = input.int(10, "Periods (bars each side)", minval=1, group=grpW)
+colSwHi   = input.color(#009688, "High", inline="sw", group=grpW)
+colSwLo   = input.color(#F44336, "Low",  inline="sw", group=grpW)
+
+float swPtHi = ta.pivothigh(swingN, swingN)
+float swPtLo = ta.pivotlow(swingN, swingN)
+plotshape(useSwings and not na(swPtHi), "Swing high", shape.triangleup,   location.abovebar, colSwHi, offset=-swingN, size=size.tiny)
+plotshape(useSwings and not na(swPtLo), "Swing low",  shape.triangledown, location.belowbar, colSwLo, offset=-swingN, size=size.tiny)
+
