@@ -1,8 +1,6 @@
-# TradingView Indicators
+# LiqSweep+iFVG Indicator
 
 Pine Script v6 indicator for intraday futures. Built and tested on MNQ (Micro E-mini Nasdaq-100), 1-minute timeframe.
-
-## LiqSweep+iFVG
 
 ![LiqSweep+iFVG on MNQ 1m](assets/liqsweep-ifvg-mnq-1m.png)
 
