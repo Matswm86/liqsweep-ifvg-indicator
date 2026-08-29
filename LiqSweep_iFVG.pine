@@ -32,6 +32,7 @@ armNY = input.bool(true,  "NY raids arm",     inline="a1", group=grpS, tooltip="
 armLO = input.bool(true,  "London raids arm", inline="a1", group=grpS)
 armAS = input.bool(true,  "Asia raids arm",   inline="a1", group=grpS)
 showBoxes = input.bool(true, "Show session boxes", group=grpS, tooltip="Shade each session as a box whose top/bottom grow with the session's high/low while it is running, then freeze. Colors follow the per-session color inputs below.")
+sessTransp = input.int(94, "Session box transparency", minval=0, maxval=100, group=grpS, tooltip="Fill transparency of the session boxes: 0 = solid, 100 = invisible. The session tag text is drawn a step more opaque than the fill.")
 maxDays   = input.int(30, "Keep drawings for N sessions per type", minval=1, group=grpS, tooltip="History depth. Older session boxes and level lines beyond this count are deleted per session type, keeping the chart readable and under TradingView's drawing limits.")
 
 grpL = "02. Levels (liquidity lines)"
@@ -64,12 +65,13 @@ grpH = "04b. Higher-timeframe FVG confluence"
 htfFvgOn = input.bool(false, "Require price inside a higher-TF FVG", group=grpH, tooltip="Location confluence: a signal only fires if price has traded inside a live higher-timeframe FVG at any point from the raid through the trigger.\n\nHigher gap timeframes filter harder: fewer signals, each backed by stronger higher-timeframe context. Off by default so the unfiltered baseline is what you see first.")
 htfFvgTf = input.string("15", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which timeframe's gaps count. Higher = stronger filter and fewer signals.")
 htfFvgShow = input.bool(false, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
-colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", group=grpH)
+colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", inline="hc", group=grpH)
+htfTransp = input.int(93, "transparency", minval=0, maxval=100, inline="hc", group=grpH, tooltip="Fill transparency of the higher-TF gap boxes: 0 = solid, 100 = invisible. Border and label follow, drawn more opaque than the fill.")
 grpP = "05. Macro dealing range (premium/discount)"
 usePD      = input.bool(true, "Show premium/discount zones", group=grpP, tooltip="Shade the active dealing range: premium (upper half) and discount (lower half) around the equilibrium midpoint. The range is the highest high / lowest low over the lookback below. Judge entries against where price sits inside the range.")
 pdLookback = input.int(50, "Dealing range lookback (bars)", minval=2, group=grpP, tooltip="How many bars back the dealing range looks for its high and low.")
-colPdBear  = input.color(color.new(#a65c4f, 20), "Premium",  inline="pd", group=grpP)
-colPdBull  = input.color(color.new(#7f9a65, 20), "Discount", inline="pd", group=grpP)
+colPdBear  = input.color(color.new(#a65c4f, 85), "Premium",  inline="pd", group=grpP, tooltip="Zone fill colors. The opacity set in the color picker is applied to the shading as-is.")
+colPdBull  = input.color(color.new(#7f9a65, 85), "Discount", inline="pd", group=grpP)
 
 grpW = "06. Swing points (fractals)"
 useSwings = input.bool(true, "Mark swing points", group=grpW, tooltip="Williams-fractal swing marks: a high/low that is the extreme of N bars on each side. A mark is CONFIRMED N bars after the swing bar and is plotted back on it - it cannot appear in real time, by definition.")
@@ -104,8 +106,8 @@ var array<string> sbTag = array.new<string>()
 f_newBox(string tag, color col) =>
     if showBoxes
         sbBox.push(box.new(time, high, time, low, xloc=xloc.bar_time,
-             border_color=color.new(col, 100), bgcolor=color.new(col, 94),
-             text=tag, text_color=color.new(col, 45), text_size=size.tiny,
+             border_color=color.new(col, 100), bgcolor=color.new(col, sessTransp),
+             text=tag, text_color=color.new(col, math.max(sessTransp - 49, 0)), text_size=size.tiny,
              text_halign=text.align_left, text_valign=text.align_top))
         sbTag.push(tag)
         int cnt = 0
@@ -256,8 +258,8 @@ if (htfFvgOn or htfFvgShow) and (hgB or hgS) and not na(hgT) and not na(hgBm) an
     hzBot.push(hgBm)
     hzDir.push(hgB ? 1 : -1)
     hzBox.push(htfFvgShow ? box.new(bar_index, hgT, bar_index + 1, hgBm, xloc=xloc.bar_index,
-         border_color=color.new(colHtfFvg, 80), bgcolor=color.new(colHtfFvg, 93),
-         text=(htfFvgTf == "240" ? "4h" : htfFvgTf == "D" ? "1D" : htfFvgTf + "m") + " FVG", text_color=color.new(colHtfFvg, 45), text_size=size.tiny) : box(na))
+         border_color=color.new(colHtfFvg, math.max(htfTransp - 13, 0)), bgcolor=color.new(colHtfFvg, htfTransp),
+         text=(htfFvgTf == "240" ? "4h" : htfFvgTf == "D" ? "1D" : htfFvgTf + "m") + " FVG", text_color=color.new(colHtfFvg, math.max(htfTransp - 48, 0)), text_size=size.tiny) : box(na))
     if hzTop.size() > 60
         box.delete(hzBox.get(0))
         hzTop.shift()
@@ -611,8 +613,8 @@ float pdEq   = (pdHigh + pdLow) / 2
 pPdHigh = plot(usePD ? pdHigh : na, "Premium Top",     color.new(colPdBear, 50), style=plot.style_linebr, display=display.data_window)
 pPdEq   = plot(usePD ? pdEq   : na, "Equilibrium",     color.new(color.gray, 50), style=plot.style_linebr, display=display.data_window)
 pPdLow  = plot(usePD ? pdLow  : na, "Discount Bottom", color.new(colPdBull, 50), style=plot.style_linebr, display=display.data_window)
-fill(pPdHigh, pPdEq, color=color.new(colPdBear, 85), title="Premium Zone")
-fill(pPdEq, pPdLow, color=color.new(colPdBull, 85), title="Discount Zone")
+fill(pPdHigh, pPdEq, color=colPdBear, title="Premium Zone")
+fill(pPdEq, pPdLow, color=colPdBull, title="Discount Zone")
 
 // dotted equilibrium midline as a drawing (drawings get no selection dots);
 // left edge clamped to bar 0: a negative bar_index coordinate is a runtime error
