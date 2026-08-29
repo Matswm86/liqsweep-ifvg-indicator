@@ -61,7 +61,7 @@ fvgFillRule = input.string("Body close through", "FVG fill rule (gap death)", op
 fvgLookback = input.int(30, "FVGs eligible from N bars before raid", minval=0, group=grpF, tooltip="Only gaps formed at most this many bars before the raid (or any time after it, while armed) can invert into a signal. Keeps the inversion tied to the raid leg instead of stale gaps from hours ago.")
 fvgExtBars = input.int(30, "Extend live gap boxes N bars", minval=5, group=grpF, tooltip="Visual only: how far unfilled gap boxes stretch to the right of their formation bar while alive.")
 invExtBars = input.int(60, "Keep inverted gap visible N bars", minval=5, group=grpF, tooltip="After an inversion fires, the flipped gap is recolored and kept on the chart this many bars so the retest into it is visible.")
-showFvg = input.bool(true, "Show FVG boxes", group=grpF, tooltip="Draw every live gap that passes the size filter. Green = bullish gap (support until inverted), red = bearish. Filled gaps disappear.")
+showFvg = input.bool(false, "Show FVG boxes", group=grpF, tooltip="Draw every live gap that passes the size filter. Green = bullish gap (support until inverted), red = bearish. Filled gaps disappear.")
 
 grpH = "04b. Higher-timeframe FVG confluence"
 htfFvgTf = input.string("15", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which higher timeframe's gaps to draw.")
