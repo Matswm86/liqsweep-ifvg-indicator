@@ -1,0 +1,1073 @@
+//@version=6
+indicator("LiqSweep+iFVG Pro", "LiqSweep+iFVG Pro", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ===================================================================
+// LiqSweep+iFVG - session-liquidity raid -> inverted-FVG reversal.
+// - Sessions (NY/London/Asia) tracked as liquidity; a level dies on
+//   its first touch, and a new session's level replaces the previous
+//   still-live level of the same type (configurable depth).
+// - A raid beyond a level arms a reversal for a limited window; all
+//   sessions arm by default (per-session toggles).
+// - Trigger: a Fair Value Gap body-closed through its far edge
+//   against the raid direction. ONE inversion clears every live
+//   same-direction arm. Pre-raid gaps within the lookback are
+//   eligible; raid-leg gaps always are.
+// - EQH/EQL module adapted from the public "EQ & RE" concept
+//   (CantoLab). Consumed swings are pruned, active lines capped.
+// - Optional overlays: higher-TF FVG boxes (off by default), the
+//   premium/discount dealing range merged from the standalone Macro
+//   Dealing Range indicator (group 05, on by default), and Williams-
+//   fractal swing-point marks (group 06, 10 periods, on by default).
+// Runs on any timeframe; defaults are sized for MNQ on 1-minute.
+// ====================================================================
+
+grpU = "00. Appearance"
+uiDensity = input.string("Balanced", "Chart density", options=["Minimal", "Balanced", "Full"], group=grpU, tooltip="One control over how much the indicator draws, so the chart can be quietened without hunting through every group.\n\nMinimal: markers and levels only. No session shading, no gap boxes, no premium/discount tint, no swing marks, no readout text.\n\nBalanced: the above plus session shading and gap boxes, with raid markers reduced to their session tag.\n\nFull: everything, including the order-flow numbers on each raid marker and the shallow-touch markers.\n\nThis can only take things away. Anything switched off in its own group stays off.")
+
+bool dMin  = uiDensity == "Minimal"
+bool dFull = uiDensity == "Full"
+
+grpS = "01. Sessions (America/New_York)"
+useNY  = input.bool(true,  "NY levels",     inline="1", group=grpS, tooltip="Track the New York session's high and low as liquidity levels. The session window is set in the field to the right.")
+nySess = input.session("0930-1600", "",     inline="1", group=grpS)
+useLO  = input.bool(true,  "London levels", inline="2", group=grpS, tooltip="Track the London session's high and low as liquidity levels.")
+loSess = input.session("0300-0930", "",     inline="2", group=grpS)
+useAS  = input.bool(true,  "Asia levels",   inline="3", group=grpS, tooltip="Track the Asia session's high and low as liquidity levels. 20:00-01:00 crosses midnight; that is handled.")
+asSess = input.session("2000-0100", "",     inline="3", group=grpS)
+armNY = input.bool(true,  "NY sweeps arm",     inline="a1", group=grpS, tooltip="Which sessions' levels can ARM a reversal. This is SEPARATE from tracking above: a session stays tracked (its high/low still counts as a draw-on-liquidity pool) even when its raids do not arm.\n\nAll sessions arm by default; narrow this to focus the signal on the session levels you care about.")
+armLO = input.bool(true,  "London sweeps arm", inline="a1", group=grpS)
+armAS = input.bool(true,  "Asia sweeps arm",   inline="a1", group=grpS)
+showBoxes_i = input.bool(true, "Show session boxes", group=grpS, tooltip="Shade each session as a box whose top/bottom grow with the session's high/low while it is running, then freeze. Colors follow the per-session color inputs below.")
+sessTransp = input.int(85, "Session box transparency", minval=0, maxval=100, group=grpS, tooltip="Fill transparency of the session boxes: 0 = solid, 100 = invisible. The session tag text is drawn a step more opaque than the fill.")
+maxDays   = input.int(90, "Keep drawings for N sessions per type", minval=1, group=grpS, tooltip="History depth. Older session boxes and level lines beyond this count are deleted per session type, keeping the chart readable and under TradingView's drawing limits.")
+
+grpL = "02. Levels (liquidity lines)"
+showLevels = input.bool(true, "Show level lines", group=grpL, tooltip="Each completed session leaves two horizontal lines: its high and its low. A line extends forward until its FIRST touch in ANY later session, then freezes with a label. Touched once = gone forever; it can never be a target again. A new session's level also replaces still-live older levels of the same type beyond the configured live depth below.")
+showRaidLabels = input.bool(true, "Show sweep markers", group=grpL, tooltip="'RAID <tag>' marks a take-out that armed the reversal (price traded beyond the level by at least the raid buffer). 'hit <tag>' marks a touch too shallow to arm; the level still dies.")
+labSize = input.string("Normal", "Label text size", options=["Tiny", "Small", "Normal", "Large"], group=grpL, tooltip="Text size for the RAID / hit markers and the entry signal labels. The order-flow readout on a raid label is two lines of numbers, so Tiny is unreadable on a large monitor.")
+sigStyle = input.string("Badge", "Entry marker style", options=["Text", "Badge"], group=grpL, tooltip="Text draws the word alone in the signal colour, with the triangle on the bar as the precise entry mark. Badge draws the older filled speech bubble, which is heavier and covers the candles behind it.")
+labSz  = labSize == "Tiny" ? size.tiny : labSize == "Small" ? size.small : labSize == "Large" ? size.large : size.normal
+liveDepth = input.int(30, "Untouched levels kept live per session type", minval=1, maxval=30, group=grpL, tooltip="1 = strict replacement: each new session's level REPLACES the previous still-live level of the same type, so only the newest untouched high/low per session type can be raided.\n\nRaise to N to keep the last N sessions' untouched levels live simultaneously, so an older pool that was never touched can still be raided days later.\n\nValues above 1 generate additional signals beyond the default model. Levels older than 'Keep drawings for N sessions' are deleted regardless, so keep that input at or above this one.")
+
+grpE = "03. Raid + trigger"
+entryMode = input.string("iFVG inversion", "Trigger after a sweep", options=["iFVG inversion", "Return through level"], group=grpE, tooltip="What converts an armed raid into an entry signal.\n\niFVG inversion: a Fair Value Gap from the raid leg gets BODY-closed through its far edge in the reversal direction (a wick through is rejection, not inversion).\n\nReturn through level: simpler variant - the bar closes back through the raided level itself.")
+sweepBufPts = input.float(0.25, "Minimum sweep beyond level (points)", minval=0, step=0.25, group=grpE, tooltip="How far past the level price must trade for the take-out to count as a raid (arm), in POINTS (1.0 = 4 MNQ ticks).")
+retTtlMin = input.int(60, "Trigger window after a sweep (minutes)", minval=1, group=grpE, tooltip="How long an armed raid stays valid. If the trigger (inversion or return) has not happened within this window, the raid is abandoned - no trade.")
+entryWin  = input.session("0100-1500", "Active entry window (NY tz)", group=grpE, tooltip="Signals only fire inside this window (New York time). Levels and FVGs are tracked around the clock; only the ENTRY is gated.")
+extFirst = input.bool(false, "External liquidity must be swept first", group=grpE, tooltip="Sequencing rule from the model: an EXTERNAL pool, meaning a session high or low, has to be taken out before the sweep of an INTERNAL level, an equal high or low, is allowed to arm anything.\n\nWith this off, any tracked level arms on its own sweep regardless of what came before. With it on, an equal high or low only arms when a session level was already swept in the same direction inside the window below.\n\nOnly affects equal highs and lows, since session levels are the external pools themselves.")
+extFirstBars = input.int(60, "External sweep stays valid for N bars", minval=1, group=grpE, tooltip="How long an external sweep keeps the door open for an internal one. On a 5-minute chart 60 bars is five hours.")
+
+grpQ = "02b. Equal highs / lows (EQH-EQL)"
+useEq   = input.bool(true, "Track equal highs / lows", group=grpQ, tooltip="Adapted from the public 'EQ & RE' concept (CantoLab). A swing high is a bar whose high is the highest of the last three (1-left/1-right pivot); when a later bar comes back into a tolerance band around it, the pair is an Equal High (EQH). Same, mirrored, for lows (EQL). Equal highs/lows are resting liquidity: a cluster of stops sits just beyond them.")
+eqTolPts = input.float(1.5, "Tolerance (points)", minval=0, step=0.25, group=grpQ, tooltip="How close a later touch must come to count as EQUAL, in POINTS. 1.0 pt = 4 MNQ ticks = the source script's default. A touch further than this beyond the swing BREAKS the point instead.")
+eqMinGap = input.int(3, "Minimum bars before an equal match", minval=1, group=grpQ, tooltip="Bars that must pass after the swing forms before a touch inside the band counts as equal. Sooner than that and the point is treated as broken (swept), never marked equal. Source default: 3.")
+eqArm   = input.bool(false, "Sweeps of EQH/EQL also arm", group=grpQ, tooltip="A take-out of an equal high/low beyond the tolerance arms a reversal exactly like a session-level raid does, so the same iFVG trigger can fire on it.\n\nOFF by default: equal highs/lows fire far more often than session levels, so expect a much noisier signal. Provided for research.")
+colEq   = input.color(#EF5350, "EQH/EQL color", group=grpQ)
+
+grpF = "04. Fair Value Gaps"
+minFvgPts = input.float(1.0, "Minimum FVG size (points)", minval=0, step=0.25, group=grpF, tooltip="Gaps smaller than this are ignored entirely - not drawn, not usable for inversion. 1.0 point on MNQ = 4 ticks. Set 0 to keep every true 3-bar gap.\n\nTradeoff: with a size filter, a smaller gap can be the FIRST inversion, so the signal waits for the next gap that passes the filter and fires a few bars later. 0 removes that lateness at the cost of chart noise.")
+fvgFillRule = input.string("Body close through", "FVG fill rule (gap death)", options=["Body close through", "Wick through"], group=grpF, tooltip="When a gap counts as FILLED and is deleted from chart and logic.\n\nBody close through: a candle body closes beyond the far edge (matches the model; a filled gap can no longer invert later).\n\nWick through: any wick beyond the far edge kills it (matches the common FVG indicators, stricter).\n\nNote: the INVERSION signal itself always requires a body close, regardless of this setting.")
+fvgLookback = input.int(30, "FVGs eligible from N bars before the sweep", minval=0, group=grpF, tooltip="Only gaps formed at most this many bars before the raid (or any time after it, while armed) can invert into a signal. Keeps the inversion tied to the raid leg instead of stale gaps from hours ago.")
+fvgExtBars = input.int(30, "Extend live gap boxes N bars", minval=5, group=grpF, tooltip="Visual only: how far unfilled gap boxes stretch to the right of their formation bar while alive.")
+invExtBars = input.int(60, "Keep inverted gap visible N bars", minval=5, group=grpF, tooltip="After an inversion fires, the flipped gap is recolored and kept on the chart this many bars so the retest into it is visible.")
+showFvg_i = input.bool(false, "Show FVG boxes", group=grpF, tooltip="Draw every live gap that passes the size filter. Green = bullish gap (support until inverted), red = bearish. Filled gaps disappear.")
+
+grpH = "04b. Higher-timeframe FVG confluence"
+htfFvgOn = input.bool(false, "Require price inside a higher-TF FVG", group=grpH, tooltip="Location confluence: a signal only fires if price has traded inside a live higher-timeframe FVG at any point from the raid through the trigger.\n\nHigher gap timeframes filter harder: fewer signals, each backed by stronger higher-timeframe context. Off by default so the unfiltered baseline is what you see first.")
+htfFvgTf = input.string("240", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which timeframe's gaps count. Higher = stronger filter and fewer signals.")
+htfFvgShow_i = input.bool(true, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
+colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", inline="hc", group=grpH)
+htfTransp = input.int(93, "transparency", minval=0, maxval=100, inline="hc", group=grpH, tooltip="Fill transparency of the higher-TF gap boxes: 0 = solid, 100 = invisible. Border and label follow, drawn more opaque than the fill.")
+grpP = "05. Macro dealing range (premium/discount)"
+usePD_i      = input.bool(true, "Show premium/discount zones", group=grpP, tooltip="Shade the active dealing range: premium (upper half) and discount (lower half) around the equilibrium midpoint. The range is the highest high / lowest low over the lookback below. Judge entries against where price sits inside the range.")
+pdLookback = input.int(50, "Dealing range lookback (bars)", minval=2, group=grpP, tooltip="How many bars back the dealing range looks for its high and low.")
+colPdBear  = input.color(color.new(#a65c4f, 85), "Premium",  inline="pd", group=grpP, tooltip="Zone fill colors. The opacity set in the color picker is applied to the shading as-is.")
+colPdBull  = input.color(color.new(#7f9a65, 85), "Discount", inline="pd", group=grpP)
+
+grpW = "06. Swing points (fractals)"
+useSwings_i = input.bool(true, "Mark swing points", group=grpW, tooltip="Williams-fractal swing marks: a high/low that is the extreme of N bars on each side. A mark is CONFIRMED N bars after the swing bar and is plotted back on it - it cannot appear in real time, by definition.")
+swingN    = input.int(10, "Periods (bars each side)", minval=1, group=grpW)
+colSwHi   = input.color(#26A69A, "High", inline="sw", group=grpW)
+colSwLo   = input.color(#EF5350, "Low",  inline="sw", group=grpW)
+
+grpA = "07. Footprint data"
+absOn = input.bool(true, "Enable footprint data", group=grpA, tooltip="Measures order flow on the bar that raids a level, using TradingView's volume-footprint data.\n\nThe question it answers: when price took out the level, was the aggressive flow in the raid direction ABSORBED, or did it keep going? Absorption is the evidence that the take-out was a stop hunt rather than a breakout.\n\nRequires a TradingView Premium or Ultimate plan and a symbol with real trade data (CME_MINI:MNQ1!, not a CFD proxy). Where footprint data is missing the readings show 'n/a' and signals fire unfiltered.")
+absTicksRow = input.int(4, "Ticks per footprint row", minval=1, group=grpA, tooltip="Price granularity of the footprint. MNQ's tick is 0.25, so 4 gives one row per index point. Lower is finer and slower.")
+absVaPct    = input.int(70, "Value area percent", minval=1, maxval=100, group=grpA, tooltip="Share of the bar's volume that defines the value area around the point of control. 70 is the convention.")
+absImbPct   = input.int(300, "Imbalance percent", minval=100, group=grpA, tooltip="A price row counts as imbalanced when one side's volume exceeds the diagonal side by this percent. 300 means a 3-to-1 dominance.")
+showStats = input.bool(false, "Show sample-size panel", group=grpA, tooltip="Counts, over the whole loaded chart, how many raids happened on an arming session, how many the order-flow filter let through, how many it blocked, and how many entry signals fired long and short. Use it to see whether a threshold sweep would have enough events to mean anything before running one.")
+
+grpV = "08. Volume profile (footprint)"
+vpOn = input.bool(true, "Show volume profile levels", group=grpV, tooltip="Builds a price-by-volume profile from the footprint rows of every bar in scope and draws its point of control and value-area edges. These are the auction levels price tends to return to, so they read as draw-on-liquidity targets rather than entry signals.\n\nNeeds the same Premium or Ultimate footprint access as group 07, and reuses that group's 'Ticks per footprint row' as its price granularity.")
+vpScope = input.string("Rolling bars", "Profile scope", options=["Rolling bars", "Day", "Fixed window"], group=grpV, tooltip="Rolling bars: a moving window of the last N bars, so the levels always describe recent trade.\n\nDay: the profile resets at each new day, and each completed day leaves its levels behind as horizontal lines.\n\nFixed window: builds the profile over one clock window only, 18:00 to 08:55 New York by default, meaning the overnight auction from the new-day open to just before the cash open. Its value-area edges freeze when the window closes and carry into the session as levels.")
+vpBars = input.int(200, "Rolling window (bars)", minval=10, group=grpV, tooltip="Window length when the scope is Rolling bars. Ignored in Day scope.")
+vpWin = input.session("1800-0855", "Fixed window (New York time)", group=grpV, tooltip="Used only in Fixed window scope. 1800-0855 is the overnight auction from the new-day open to five minutes before the cash open.")
+vpReclaim = input.bool(true, "Mark value-area reclaims", group=grpV, tooltip="After the fixed window closes, marks a failed auction: price closes beyond the value-area low and then closes back above it, which reads long, or closes beyond the value-area high and back below it, which reads short. This is the same close-back-through logic the sweep trigger uses, pointed at the value-area edges.")
+vpVaPct = input.float(70, "Value area percent", minval=1, maxval=100, step=5, group=grpV, tooltip="Share of the profile's volume enclosed by the value area, expanded outward from the point of control. 70 is the convention.")
+vpPriorDays = input.int(3, "Completed days kept", minval=0, maxval=20, group=grpV, tooltip="In Day scope, how many finished days keep their point of control and value-area lines on the chart. An untouched prior point of control is a magnet; set 0 to hide them.")
+colPoc = input.color(#FFB74D, "Point of control", inline="vp", group=grpV)
+colVa  = input.color(#78909C, "Value area edges", inline="vp", group=grpV)
+
+grpM = "11. SMT divergence (correlated market)"
+smtOn = input.bool(true, "Show SMT divergence", group=grpM, tooltip="Compares this chart against a correlated market. When MNQ takes out a recent low and the comparison market does NOT take out its own, the sweep was one index acting alone rather than the whole market turning, which is the classic non-confirmation.\n\nUses ordinary price data, so it needs no footprint, no Level 2 and no data subscription beyond the comparison symbol itself.")
+smtSym = input.symbol("CME_MINI:MES1!", "Comparison symbol", group=grpM, tooltip="The correlated market. MES is the S&P equivalent of MNQ and is the usual pairing; MYM tracks the Dow if you want a wider spread between the two.")
+smtTf = input.string("Chart", "Comparison timeframe", options=["Chart", "1", "5", "15", "60"], group=grpM, tooltip="Chart follows whatever timeframe you are on, so the comparison stays aligned when you switch between 1 and 5 minutes. Pin it to a fixed timeframe to read the divergence from one resolution regardless of the chart.")
+smtRef = input.string("Session extreme", "How the comparison is made", options=["Session extreme", "Rolling bars"], group=grpM, tooltip="Session extreme is how the model is taught: at the moment a session level is swept, ask whether the comparison market exceeded ITS OWN high or low from that same session. The comparison is tied to the pool being swept.\n\nRolling bars is the cruder statistical version: whether the comparison market made a new extreme over a fixed lookback. Kept for comparison, not because any source teaches it.")
+smtLook = input.int(20, "Rolling lookback (bars)", minval=3, group=grpM, tooltip="Only used when the comparison is set to Rolling bars.")
+colSmtUp = input.color(#26A69A, "Bullish", inline="sm", group=grpM)
+colSmtDn = input.color(#EF5350, "Bearish", inline="sm", group=grpM)
+
+grpZ = "12. CVD strip (footprint)"
+cvdOn = input.bool(true, "Show cumulative delta strip", group=grpZ, tooltip="Draws cumulative volume delta as a shape inside the price pane, mapped into a band at the bottom of the visible range.\n\nPine gives a script one pane, so this is the only way to see delta without a second indicator. The trade-off: the band has no axis of its own, so it reads as shape and divergence only, never as a number.")
+cvdReset = input.string("Day", "Reset the running total", options=["Never", "Day", "Session"], group=grpZ, tooltip="Cumulative delta drifts without a starting point. Day restarts each new day. Session restarts at the start of the window below.")
+cvdPick = input.string("New York", "Which session", options=["New York", "London", "Asia"], group=grpZ, tooltip="Used only when the reset is set to Session. New York 0930-1600, London 0300-0930, Asia 2000-0100, New York time.")
+cvdWin = input.int(200, "Bars used to scale the band", minval=20, group=grpZ, tooltip="The band is rescaled against the highest and lowest delta over this many bars, so the shape stays readable as the total grows.")
+cvdHeight = input.float(15, "Band height (percent of visible range)", minval=5, maxval=40, step=5, group=grpZ)
+cvdDrop = input.float(8, "Band offset below price (percent of range)", minval=0, maxval=40, step=2, group=grpZ, tooltip="Pushes the whole band further below the lowest low in the scaling window, so the delta shape stops running into the candles. Raise it if price still overlaps the line.")
+cvdDivPlace = input.string("Under the candle", "Divergence label placement", options=["Under the candle", "On the strip"], group=grpZ, tooltip="Under the candle puts the note below the swing bar it refers to, which is where it reads fastest. On the strip puts it on the delta line itself, next to the shape that produced it.")
+cvdPivot = input.int(5, "Divergence pivot strength (bars each side)", minval=1, group=grpZ, tooltip="How many bars must sit either side of a swing for the divergence check to use it. This is deliberately separate from the swing marks in group 06 and defaults to 5, the same value the standalone CVD pane uses, so both scripts mark the same divergences.")
+cvdDiv = input.bool(true, "Mark delta divergence against price", group=grpZ, tooltip="Marks a confirmed price swing high that is higher than the previous one while delta made a lower high, and the mirror case at lows. Uses the swing strength from group 06, so it appears that many bars after the turn and never repaints.")
+colCvdUp = input.color(#26A69A, "Rising", inline="cv", group=grpZ)
+colCvdDn = input.color(#EF5350, "Falling", inline="cv", group=grpZ)
+
+grpC = "10. Colors"
+colNY = input.color(#FFB74D, "NY", inline="c", group=grpC, tooltip="Session box + level line colors per session type.")
+colLO = input.color(#64B5F6, "London", inline="c", group=grpC)
+colAS = input.color(#BA68C8, "Asia", inline="c", group=grpC)
+colBull = input.color(#26A69A, "Bull FVG", inline="c2", group=grpC, tooltip="Fill colors for live gap boxes and the inverted-gap highlight.")
+colBear = input.color(#EF5350, "Bear FVG", inline="c2", group=grpC)
+
+// ── Density-adjusted toggles ────────────────────────────────────────
+// Each drawing switch below is its own input ANDed with the density
+// choice, so lowering the density can hide an element but never reveal
+// one the user turned off.
+bool showBoxes  = showBoxes_i  and not dMin
+bool showFvg    = showFvg_i    and not dMin
+bool usePD      = usePD_i      and not dMin
+bool useSwings  = useSwings_i  and not dMin
+bool htfFvgShow = htfFvgShow_i and not dMin
+
+
+tzNY = "America/New_York"
+tick = syminfo.mintick
+// vertical clearance that floats event labels off the candles (~0.6 ATR,
+// tick fallback while ATR warms up). Visual only.
+float labPad = nz(ta.atr(14), tick * 8) * 0.6
+useIfvg = entryMode == "iFVG inversion"
+bodyFill = fvgFillRule == "Body close through"
+
+inNY = useNY and not na(time(timeframe.period, nySess, tzNY))
+inLO = useLO and not na(time(timeframe.period, loSess, tzNY))
+inAS = useAS and not na(time(timeframe.period, asSess, tzNY))
+inWin = not na(time(timeframe.period, entryWin, tzNY))
+
+// ── SMT comparison series ───────────────────────────────────────────
+// Pulled once at the top so the sweep loop below can ask, at the moment a
+// level is taken out, whether the correlated market took out its own.
+string smtRes = smtTf == "Chart" ? timeframe.period : smtTf
+[smtHigh, smtLow] = request.security(smtSym, smtRes, [high, low], lookahead=barmerge.lookahead_off)
+float cmpPriorLow  = ta.lowest(smtLow, smtLook)[1]
+float cmpPriorHigh = ta.highest(smtHigh, smtLook)[1]
+
+// ── Session boxes ──────────────────────────────────────────────────
+var array<box>    sbBox = array.new<box>()
+var array<string> sbTag = array.new<string>()
+
+f_newBox(string tag, color col) =>
+    if showBoxes
+        sbBox.push(box.new(time, high, time, low, xloc=xloc.bar_time,
+             border_color=color.new(col, math.max(0, sessTransp - 35)), bgcolor=color.new(col, math.min(100, sessTransp + 3)),
+             text=tag, text_color=color.new(col, math.max(sessTransp - 49, 0)), text_size=size.tiny,
+             text_halign=text.align_left, text_valign=text.align_top))
+        sbTag.push(tag)
+        int cnt = 0
+        for j = sbTag.size() - 1 to 0
+            if sbTag.get(j) == tag
+                cnt += 1
+                if cnt > maxDays
+                    box.delete(sbBox.get(j))
+                    sbBox.remove(j)
+                    sbTag.remove(j)
+                    break
+
+f_growBox(string tag) =>
+    if showBoxes and sbTag.size() > 0
+        for j = sbTag.size() - 1 to 0
+            if sbTag.get(j) == tag
+                box b = sbBox.get(j)
+                b.set_right(time)
+                b.set_top(math.max(b.get_top(), high))
+                b.set_bottom(math.min(b.get_bottom(), low))
+                break
+
+// ── Level lines ────────────────────────────────────────────────────
+var array<line>   lvLine = array.new<line>()
+var array<string> lvTag  = array.new<string>()
+var array<int>    lvSide = array.new<int>()
+var array<bool>   lvLive = array.new<bool>()
+var array<float>  lvCmp  = array.new_float()   // the comparison market's extreme over the same session
+
+f_newLevel(string tag, int side, float price, color col, float cmpExt) =>
+    if showLevels
+        // replacement semantics: a new session's level retires still-live older
+        // levels of the same tag beyond the configured live depth. liveDepth=1
+        // (default) = strict replacement: newest untouched level only.
+        if lvTag.size() > 0
+            int liveCnt = 0
+            for j = lvTag.size() - 1 to 0
+                if lvTag.get(j) == tag and lvLive.get(j)
+                    liveCnt += 1
+                    if liveCnt > liveDepth - 1
+                        lvLive.set(j, false)
+        lvLine.push(line.new(time, price, time, price, xloc=xloc.bar_time, color=col, width=2))
+        lvTag.push(tag)
+        lvSide.push(side)
+        lvLive.push(true)
+        lvCmp.push(cmpExt)
+        int cnt = 0
+        for j = lvTag.size() - 1 to 0
+            if lvTag.get(j) == tag
+                cnt += 1
+                if cnt > maxDays
+                    line.delete(lvLine.get(j))
+                    lvLine.remove(j)
+                    lvTag.remove(j)
+                    lvSide.remove(j)
+                    lvLive.remove(j)
+                    lvCmp.remove(j)
+                    break
+
+var float nyHi = na, var float nyLo = na
+var float loHi = na, var float loLo = na
+var float asHi = na, var float asLo = na
+// the same session windows measured on the comparison market, so a sweep can
+// ask whether that market took out its own session extreme rather than ours
+var float cNyHi = na, var float cNyLo = na
+var float cLoHi = na, var float cLoLo = na
+var float cAsHi = na, var float cAsLo = na
+
+if inNY
+    if na(nyHi)
+        f_newBox("NY", colNY)
+    f_growBox("NY")
+    nyHi := na(nyHi) ? high : math.max(nyHi, high)
+    nyLo := na(nyLo) ? low : math.min(nyLo, low)
+    cNyHi := na(cNyHi) ? smtHigh : math.max(cNyHi, smtHigh)
+    cNyLo := na(cNyLo) ? smtLow  : math.min(cNyLo, smtLow)
+else if not na(nyHi)
+    f_newLevel("NYH", 1, nyHi, colNY, cNyHi)
+    f_newLevel("NYL", -1, nyLo, colNY, cNyLo)
+    nyHi := na
+    nyLo := na
+    cNyHi := na
+    cNyLo := na
+if inLO
+    if na(loHi)
+        f_newBox("LONDON", colLO)
+    f_growBox("LONDON")
+    loHi := na(loHi) ? high : math.max(loHi, high)
+    loLo := na(loLo) ? low : math.min(loLo, low)
+    cLoHi := na(cLoHi) ? smtHigh : math.max(cLoHi, smtHigh)
+    cLoLo := na(cLoLo) ? smtLow  : math.min(cLoLo, smtLow)
+else if not na(loHi)
+    f_newLevel("LOH", 1, loHi, colLO, cLoHi)
+    f_newLevel("LOL", -1, loLo, colLO, cLoLo)
+    loHi := na
+    loLo := na
+    cLoHi := na
+    cLoLo := na
+if inAS
+    if na(asHi)
+        f_newBox("ASIA", colAS)
+    f_growBox("ASIA")
+    asHi := na(asHi) ? high : math.max(asHi, high)
+    asLo := na(asLo) ? low : math.min(asLo, low)
+    cAsHi := na(cAsHi) ? smtHigh : math.max(cAsHi, smtHigh)
+    cAsLo := na(cAsLo) ? smtLow  : math.min(cAsLo, smtLow)
+else if not na(asHi)
+    f_newLevel("ASH", 1, asHi, colAS, cAsHi)
+    f_newLevel("ASL", -1, asLo, colAS, cAsLo)
+    asHi := na
+    asLo := na
+    cAsHi := na
+    cAsLo := na
+
+// ── Live FVGs with fill-death lifecycle ────────────────────────────
+var array<float> fvgTop = array.new_float()
+var array<float> fvgBot = array.new_float()
+var array<int>   fvgIdx = array.new_int()
+var array<int>   fvgDir = array.new_int()      // 1 bull, -1 bear
+var array<box>   fvgBoxA = array.new<box>()
+var array<int>   fvgInvAt = array.new_int()    // -1 = live; else bar of inversion
+
+f_addFvg(int d, float top, float bot) =>
+    fvgTop.push(top)
+    fvgBot.push(bot)
+    fvgIdx.push(bar_index)
+    fvgDir.push(d)
+    fvgInvAt.push(-1)
+    color cc = d == 1 ? colBull : colBear
+    fvgBoxA.push(showFvg ? box.new(bar_index - 1, top, bar_index + fvgExtBars, bot,
+         border_color=color.new(cc, 100), bgcolor=color.new(cc, 92)) : box(na))
+    if fvgTop.size() > 150
+        box.delete(fvgBoxA.get(0))
+        fvgTop.shift()
+        fvgBot.shift()
+        fvgIdx.shift()
+        fvgDir.shift()
+        fvgInvAt.shift()
+        fvgBoxA.shift()
+
+if useIfvg
+    if low > high[2] and low - high[2] >= minFvgPts
+        f_addFvg(1, low, high[2])
+    if high < low[2] and low[2] - high >= minFvgPts
+        f_addFvg(-1, low[2], high)
+
+// ── Higher-timeframe FVGs (location confluence, group 04b) ─────────
+// Same 3-bar gap rule as the 1m gaps, requested on the selected timeframe
+// with lookahead_off so a gap only exists once its HTF bar has confirmed.
+var array<float> hzTop = array.new_float()
+var array<float> hzBot = array.new_float()
+var array<int>   hzDir = array.new_int()
+var array<box>   hzBox = array.new<box>()
+var int lastHzTime = 0
+
+f_htfGap() =>
+    bool gb = low > high[2] and low - high[2] >= minFvgPts
+    bool gs = high < low[2] and low[2] - high >= minFvgPts
+    [gb, gs, gb ? low : gs ? low[2] : na, gb ? high[2] : gs ? high : na, time]
+
+// when the overlay is off, request the chart TF instead - near-free, and
+// the htfFvgShow guard below already discards the values
+[hgB, hgS, hgT, hgBm, hgTime] = request.security(syminfo.tickerid, (htfFvgOn or htfFvgShow) ? htfFvgTf : timeframe.period, f_htfGap(), lookahead=barmerge.lookahead_off)
+
+if (htfFvgOn or htfFvgShow) and (hgB or hgS) and not na(hgT) and not na(hgBm) and hgTime != lastHzTime
+    lastHzTime := hgTime
+    hzTop.push(hgT)
+    hzBot.push(hgBm)
+    hzDir.push(hgB ? 1 : -1)
+    hzBox.push(htfFvgShow ? box.new(bar_index, hgT, bar_index + 1, hgBm, xloc=xloc.bar_index,
+         border_color=color.new(colHtfFvg, math.max(htfTransp - 13, 0)), bgcolor=color.new(colHtfFvg, htfTransp),
+         text=(htfFvgTf == "240" ? "4h" : htfFvgTf == "D" ? "1D" : htfFvgTf + "m") + " FVG", text_color=color.new(colHtfFvg, math.max(htfTransp - 48, 0)), text_size=size.tiny) : box(na))
+    if hzTop.size() > 60
+        box.delete(hzBox.get(0))
+        hzTop.shift()
+        hzBot.shift()
+        hzDir.shift()
+        hzBox.shift()
+
+// gap death: a chart-bar body close beyond the far edge (same rule as 1m)
+if hzTop.size() > 0
+    for j = hzTop.size() - 1 to 0
+        bool deadH = hzDir.get(j) == 1 ? close < hzBot.get(j) : close > hzTop.get(j)
+        if deadH
+            box.delete(hzBox.get(j))
+            hzTop.remove(j)
+            hzBot.remove(j)
+            hzDir.remove(j)
+            hzBox.remove(j)
+        else if htfFvgShow and not na(hzBox.get(j))
+            box.set_right(hzBox.get(j), bar_index + 1)
+
+// does this bar trade inside a live higher-TF gap? (confluence filter)
+f_inHtfZone() =>
+    bool found = false
+    if hzTop.size() > 0
+        for j = 0 to hzTop.size() - 1
+            if low <= hzTop.get(j) and high >= hzBot.get(j)
+                found := true
+                break
+    found
+bool inHtfGap = f_inHtfZone()
+
+// ── Arms ───────────────────────────────────────────────────────────
+var array<int>   armDir = array.new_int()
+var array<float> armLvl = array.new_float()
+var array<float> armExt = array.new_float()
+var array<int>   armExp = array.new_int()
+var array<int>   armI0  = array.new_int()
+var array<bool>  armQ   = array.new<bool>()
+
+// ── EQH/EQL module (adapted from "Equal Highs and Lows with Relative
+// [CantoLab]" - same swing/equal/sweep semantics, bar_time drawings) ──
+type BarRows
+    array<int>   keys
+    array<float> vols
+
+type SwingPoint
+    float price      = na
+    int   time       = na
+    int   formBarIdx = na
+    bool  referenced = false
+
+type ActiveLine
+    line  ln         = na
+    label lb         = na
+    int   startTime  = na
+    float startPrice = na
+    int   endTime    = na
+    float endPrice   = na
+
+method isFarEnough(SwingPoint sp, int currentBarIdx, int minGap) =>
+    (currentBarIdx - sp.formBarIdx) > minGap
+
+method checkLevel(SwingPoint sp, float level, float tolerance, bool isHigh, int currentBarIdx, int minGap) =>
+    string state = "none"
+    if not sp.referenced
+        bool farEnough = sp.isFarEnough(currentBarIdx, minGap)
+        if isHigh
+            if level > sp.price + tolerance
+                state := "break"
+            else if farEnough and level <= sp.price + tolerance and level >= sp.price - tolerance
+                state := "equal"
+        else
+            if level < sp.price - tolerance
+                state := "break"
+            else if farEnough and level >= sp.price - tolerance and level <= sp.price + tolerance
+                state := "equal"
+        if state != "none"
+            sp.referenced := true
+    state
+
+method mergeOrCreate(ActiveLine[] arr, SwingPoint sp, int endTime, float endPrice, float tolerance, bool isHigh) =>
+    int matchIdx = -1
+    if arr.size() > 0
+        for i = 0 to arr.size() - 1
+            ActiveLine alx = arr.get(i)
+            if alx.endTime == sp.time and math.abs(alx.endPrice - sp.price) <= tolerance
+                matchIdx := i
+                break
+    if matchIdx == -1
+        ActiveLine alNew = ActiveLine.new()
+        alNew.ln := line.new(sp.time, sp.price, endTime, endPrice, xloc=xloc.bar_time, color=colEq, width=1)
+        alNew.startTime := sp.time
+        alNew.startPrice := sp.price
+        arr.push(alNew)
+        matchIdx := arr.size() - 1
+    ActiveLine al = arr.get(matchIdx)
+    al.endTime := endTime
+    al.endPrice := endPrice
+    line.set_x2(al.ln, endTime)
+    line.set_y2(al.ln, endPrice)
+    bool exact = al.startPrice == endPrice
+    string labelText = isHigh ? (exact ? "EQH" : "REH") : (exact ? "EQL" : "REL")
+    int midTime = int(math.round((al.startTime + endTime) / 2))
+    if na(al.lb)
+        al.lb := label.new(midTime, endPrice, labelText, xloc=xloc.bar_time,
+             style=isHigh ? label.style_label_down : label.style_label_up,
+             color=color.new(color.white, 100), textcolor=colEq, size=size.small)
+    if not na(al.lb)
+        al.lb.set_x(midTime)
+        al.lb.set_y(endPrice)
+        al.lb.set_text(labelText)
+
+// last EXTERNAL sweep, meaning a session level, used by the sequencing rule
+var int extBar = -99999
+var int extDir = 0
+
+method checkSweep(ActiveLine[] arr, float level, bool isHigh, float tolerance) =>
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            ActiveLine al = arr.get(i)
+            float extreme = isHigh ? math.max(al.startPrice, al.endPrice) : math.min(al.startPrice, al.endPrice)
+            bool swept = isHigh ? level > extreme + tolerance : level < extreme - tolerance
+            if swept
+                bool seqOk = not extFirst or (extDir == (isHigh ? -1 : 1) and bar_index - extBar <= extFirstBars)
+                if eqArm and seqOk
+                    armDir.push(isHigh ? -1 : 1)
+                    armLvl.push(extreme)
+                    armExt.push(level)
+                    armExp.push(time + retTtlMin * 60000)
+                    armI0.push(bar_index)
+                    armQ.push(inHtfGap)
+                line.delete(al.ln)
+                if not na(al.lb)
+                    label.delete(al.lb)
+                arr.remove(i)
+
+var SwingPoint[] swingHighs  = array.new<SwingPoint>()
+var SwingPoint[] swingLows   = array.new<SwingPoint>()
+var ActiveLine[] activeHighs = array.new<ActiveLine>()
+var ActiveLine[] activeLows  = array.new<ActiveLine>()
+
+int hb3 = ta.highestbars(3)
+int lb3 = ta.lowestbars(3)
+
+if useEq
+    float eqH1 = high[1]
+    float eqL1 = low[1]
+    int   eqT1 = time[1]
+    activeHighs.checkSweep(eqH1, true, eqTolPts)
+    activeLows.checkSweep(eqL1, false, eqTolPts)
+    int recentEQHIdx  = -1
+    int recentEQHTime = -1
+    if swingHighs.size() > 0
+        for i = 0 to swingHighs.size() - 1
+            SwingPoint sp = swingHighs.get(i)
+            if sp.checkLevel(eqH1, eqTolPts, true, bar_index, eqMinGap) == "equal" and sp.time > recentEQHTime
+                recentEQHTime := sp.time
+                recentEQHIdx  := i
+    int recentEQLIdx  = -1
+    int recentEQLTime = -1
+    if swingLows.size() > 0
+        for i = 0 to swingLows.size() - 1
+            SwingPoint spL = swingLows.get(i)
+            if spL.checkLevel(eqL1, eqTolPts, false, bar_index, eqMinGap) == "equal" and spL.time > recentEQLTime
+                recentEQLTime := spL.time
+                recentEQLIdx  := i
+    if hb3 == -1
+        swingHighs.push(SwingPoint.new(high[1], time[1], bar_index, false))
+    if lb3 == -1
+        swingLows.push(SwingPoint.new(low[1], time[1], bar_index, false))
+    if recentEQHIdx != -1
+        activeHighs.mergeOrCreate(swingHighs.get(recentEQHIdx), eqT1, eqH1, eqTolPts, true)
+    if recentEQLIdx != -1
+        activeLows.mergeOrCreate(swingLows.get(recentEQLIdx), eqT1, eqL1, eqTolPts, false)
+    // prune consumed swing points (behavior-neutral: checkLevel skips
+    // referenced ones anyway) and cap active EQ lines so the arrays
+    // and drawing count stay bounded on long histories
+    if swingHighs.size() > 0
+        for i = swingHighs.size() - 1 to 0
+            if swingHighs.get(i).referenced
+                swingHighs.remove(i)
+    if swingLows.size() > 0
+        for i = swingLows.size() - 1 to 0
+            if swingLows.get(i).referenced
+                swingLows.remove(i)
+    if activeHighs.size() > 100
+        ActiveLine oldEqH = activeHighs.get(0)
+        line.delete(oldEqH.ln)
+        label.delete(oldEqH.lb)
+        activeHighs.remove(0)
+    if activeLows.size() > 100
+        ActiveLine oldEqL = activeLows.get(0)
+        line.delete(oldEqL.ln)
+        label.delete(oldEqL.lb)
+        activeLows.remove(0)
+
+// ── Order-flow absorption on the raid bar (footprint) ───────────────
+// request.footprint() reads the CURRENT chart bar only, so every reading
+// below belongs to the bar being processed. It returns na wherever
+// footprint data is unavailable (plan, symbol, or history depth), and
+// every downstream test fails open rather than silently dropping signals.
+
+fpBar = absOn or vpOn or cvdOn ? request.footprint(absTicksRow, absVaPct, absImbPct) : na
+bool fpOk = not na(fpBar)
+float fpDelta = fpOk ? footprint.delta(fpBar) : na
+
+// Verdict plus raw readings for a raid on one side. isHigh=true means price
+// raided UP through a high, so the reversal being armed is a short. Kept as a
+// single function: the row scan and the verdict share the same locals, which
+// avoids returning a tuple into another function's scope.
+var int lvLastBar = -1   // bar the last sweep marker was drawn on
+var int lvStack   = 0    // markers already drawn on that bar
+
+// ── Export slots + counters ─────────────────────────────────────────
+// The raid readings are produced deep inside the level loop. These
+// bar-scoped variables lift them to the top level so they can be plotted
+// into the Data Window, which is what TradingView's "Export chart data"
+// writes to CSV. Everything here is measurement, never logic.
+
+float xSweepDir = na    // -1 = a high was raided (short arm), +1 = a low
+float xSweepLvl = na
+
+var int cRaid  = 0     // raids on an arming session, filter aside
+var int cArm   = 0
+var int cSigL  = 0
+var int cSigS  = 0
+
+if lvLine.size() > 0
+    for j = lvLine.size() - 1 to 0
+        if not lvLive.get(j)
+            continue
+        line ln = lvLine.get(j)
+        float price = ln.get_y1()
+        ln.set_x2(time)
+        bool isHigh = lvSide.get(j) == 1
+        bool touched = isHigh ? high >= price : low <= price
+        if touched
+            lvLive.set(j, false)
+            bool raided = isHigh ? high >= price + sweepBufPts : low <= price - sweepBufPts
+            string tg0 = lvTag.get(j)
+            bool armOk0 = str.startswith(tg0, "NY") ? armNY : str.startswith(tg0, "LO") ? armLO : armAS
+            // the correlated market failed to take out its own matching extreme
+            // taught version: did the comparison market take out ITS OWN extreme
+            // from the same session? Rolling is the cruder fixed-window variant.
+            float cmpLvl = lvCmp.get(j)
+            bool smtDiv = false
+            if smtOn and raided
+                if smtRef == "Session extreme" and not na(cmpLvl)
+                    smtDiv := isHigh ? smtHigh <= cmpLvl : smtLow >= cmpLvl
+                else if smtRef == "Rolling bars"
+                    smtDiv := isHigh ? smtHigh <= cmpPriorHigh : smtLow >= cmpPriorLow
+            if showRaidLabels
+                // float the marker clear of the wick instead of sitting on the level:
+                // highs anchor above the bar's high, lows below its low, +/- labPad
+                float lvY = isHigh ? math.max(high, price) + labPad : math.min(low, price) - labPad
+                // several levels can be raided by one bar; step each marker
+                // further out so they stack instead of printing on top of each other
+                if bar_index != lvLastBar
+                    lvLastBar := bar_index
+                    lvStack   := 0
+                lvY := isHigh ? lvY + labPad * 1.4 * lvStack : lvY - labPad * 1.4 * lvStack
+                lvStack += 1
+                color lvCol = str.startswith(tg0, "NY") ? colNY : str.startswith(tg0, "LO") ? colLO : colAS
+                if raided
+                    label.new(time, lvY, (armOk0 ? "SWEEP " : "swept ") + tg0 + (smtDiv ? "  SMT" : ""), xloc=xloc.bar_time,
+                         style=dFull ? (isHigh ? label.style_label_down : label.style_label_up) : label.style_none,
+                         color=color.new(lvCol, armOk0 ? 25 : 60),
+                         textcolor=dFull ? color.white : color.new(lvCol, 0), size=labSz)
+                else if dFull
+                    // shallow touch: quiet text-only marker, no bubble
+                    label.new(time, lvY, "hit " + tg0, xloc=xloc.bar_time,
+                         style=label.style_none, textcolor=color.new(color.gray, 35), size=labSz)
+            if raided and armOk0
+                extBar := bar_index
+                extDir := isHigh ? -1 : 1
+                cRaid += 1
+                cArm += 1
+                xSweepDir := isHigh ? -1 : 1
+                xSweepLvl := price
+            if raided and armOk0
+                armDir.push(isHigh ? -1 : 1)
+                armLvl.push(price)
+                armExt.push(isHigh ? high : low)
+                armExp.push(time + retTtlMin * 60000)
+                armI0.push(bar_index)
+                armQ.push(inHtfGap)
+
+// ── Trigger scan + FVG lifecycle ───────────────────────────────────
+// Expiry pass first, then ONE inversion scan per direction. A single
+// body-closed gap clears EVERY live arm of that direction: one signal
+// per reversal context. (A per-arm scan that consumes one gap per arm
+// fires late duplicate signals when raids stack.)
+f_fireDir(int d) =>
+    // newest same-direction armI0 anchors the pre-raid lookback window
+    int newestI0 = -1
+    if armDir.size() > 0
+        for j = 0 to armDir.size() - 1
+            if armDir.get(j) == d
+                newestI0 := math.max(newestI0, armI0.get(j))
+    bool qOk = not htfFvgOn
+    if not qOk and armDir.size() > 0
+        for j = 0 to armDir.size() - 1
+            if armDir.get(j) == d and armQ.get(j)
+                qOk := true
+                break
+    int hitK = -1
+    if newestI0 >= 0 and qOk
+        if useIfvg
+            if fvgTop.size() > 0
+                for k = fvgTop.size() - 1 to 0
+                    if fvgInvAt.get(k) != -1
+                        continue
+                    if fvgIdx.get(k) < newestI0 - fvgLookback
+                        break
+                    if d == -1 and fvgDir.get(k) == 1 and close < fvgBot.get(k)
+                        hitK := k
+                        break
+                    if d == 1 and fvgDir.get(k) == -1 and close > fvgTop.get(k)
+                        hitK := k
+                        break
+        else
+            for j = 0 to armDir.size() - 1
+                if armDir.get(j) == d and (d == -1 ? close < armLvl.get(j) : close > armLvl.get(j))
+                    hitK := -2
+                    break
+    hitK
+
+f_dropDir(int d) =>
+    if armDir.size() > 0
+        for j = armDir.size() - 1 to 0
+            if armDir.get(j) == d
+                armDir.remove(j)
+                armLvl.remove(j)
+                armExt.remove(j)
+                armExp.remove(j)
+                armI0.remove(j)
+                armQ.remove(j)
+
+plotTrig = 0
+if armDir.size() > 0
+    for j = armDir.size() - 1 to 0
+        if time > armExp.get(j)
+            armDir.remove(j)
+            armLvl.remove(j)
+            armExt.remove(j)
+            armExp.remove(j)
+            armI0.remove(j)
+            armQ.remove(j)
+        else
+            armExt.set(j, armDir.get(j) == -1 ? math.max(armExt.get(j), high) : math.min(armExt.get(j), low))
+
+if htfFvgOn and inHtfGap and armDir.size() > 0
+    for j = 0 to armDir.size() - 1
+        armQ.set(j, true)
+
+for s = 0 to 1
+    int d = s == 0 ? -1 : 1
+    int hitK = f_fireDir(d)
+    if hitK != -1
+        if hitK >= 0
+            fvgInvAt.set(hitK, bar_index)
+            box b = fvgBoxA.get(hitK)
+            if not na(b)
+                b.set_border_color(color.new(d == -1 ? colBear : colBull, 40))
+                b.set_bgcolor(color.new(d == -1 ? colBear : colBull, 82))
+                b.set_right(bar_index + invExtBars)
+        // signal label floats 2x pad beyond the bar (clears both the wick and
+        // the entry triangle); the triangle stays the precise entry marker
+        float sigY = d == -1 ? high + labPad * 2 : low - labPad * 2
+        color sigCol = d == -1 ? colBear : colBull
+        // the triangle on the bar is the precise entry mark, so the word next
+        // to it only has to be readable, not boxed
+        string sigTxt = (d == -1 ? "SHORT" : "LONG") + (inWin ? "" : dFull ? "  outside window" : "")
+        bool badge = sigStyle == "Badge"
+        label.new(time, sigY, sigTxt, xloc=xloc.bar_time,
+             style=badge ? (d == -1 ? label.style_label_down : label.style_label_up) : label.style_none,
+             color=color.new(sigCol, badge ? 35 : 100),
+             textcolor=badge ? color.white : color.new(sigCol, inWin ? 0 : 45), size=labSz)
+        f_dropDir(d)
+        if inWin
+            plotTrig := d
+            if d == 1
+                cSigL += 1
+            else
+                cSigS += 1
+
+// filled gaps die: delete box + remove from logic (inversion above already ran)
+if fvgTop.size() > 0
+    for k = fvgTop.size() - 1 to 0
+        int inv = fvgInvAt.get(k)
+        bool dead = false
+        if inv != -1
+            dead := bar_index > inv + invExtBars
+        else
+            if fvgIdx.get(k) < bar_index
+                if fvgDir.get(k) == 1
+                    dead := bodyFill ? close < fvgBot.get(k) : low < fvgBot.get(k)
+                else
+                    dead := bodyFill ? close > fvgTop.get(k) : high > fvgTop.get(k)
+                if not dead and na(fvgBoxA.get(k)) == false and bar_index <= fvgIdx.get(k) + fvgExtBars
+                    box b2 = fvgBoxA.get(k)
+                    b2.set_right(bar_index + 1)
+        if dead
+            box.delete(fvgBoxA.get(k))
+            fvgTop.remove(k)
+            fvgBot.remove(k)
+            fvgIdx.remove(k)
+            fvgDir.remove(k)
+            fvgInvAt.remove(k)
+            fvgBoxA.remove(k)
+
+plotshape(plotTrig == -1, "Signal short (enter next bar)", shape.triangledown, location.abovebar, color.red, size=size.small, display=display.pane)
+plotshape(plotTrig == 1, "Signal long (enter next bar)", shape.triangleup, location.belowbar, color.green, size=size.small, display=display.pane)
+bgcolor(armDir.size() > 0 ? color.new(color.yellow, 92) : na, title="Armed (level swept, waiting for trigger)")
+
+// ── Macro dealing range: premium/discount (merged from the standalone
+// "Macro Dealing Range & Premium/Discount" indicator) ────────────────
+
+float pdHigh = ta.highest(high, pdLookback)
+float pdLow  = ta.lowest(low, pdLookback)
+float pdEq   = (pdHigh + pdLow) / 2
+
+// Boundary plots go to the Data Window only (display.data_window): the
+// fills between them still render on the chart, but with no pane plots
+// there are no selection dots when the indicator is clicked.
+pPdHigh = plot(usePD ? pdHigh : na, "Premium Top",     color.new(colPdBear, 50), style=plot.style_linebr, display=display.data_window)
+pPdEq   = plot(usePD ? pdEq   : na, "Equilibrium",     color.new(color.gray, 50), style=plot.style_linebr, display=display.data_window)
+pPdLow  = plot(usePD ? pdLow  : na, "Discount Bottom", color.new(colPdBull, 50), style=plot.style_linebr, display=display.data_window)
+fill(pPdHigh, pPdEq, color=colPdBear, title="Premium Zone")
+fill(pPdEq, pPdLow, color=colPdBull, title="Discount Zone")
+
+// dotted equilibrium midline as a drawing (drawings get no selection dots);
+// left edge clamped to bar 0: a negative bar_index coordinate is a runtime error
+var line pdEqLine = na
+if usePD and barstate.islast
+    line.delete(pdEqLine)
+    pdEqLine := line.new(math.max(bar_index - pdLookback + 1, 0), pdEq, bar_index + 3, pdEq, color=color.new(color.gray, 45), style=line.style_dotted)
+
+// ── Swing points (Williams fractals) ─────────────────────────────────
+
+float swPtHi = ta.pivothigh(swingN, swingN)
+float swPtLo = ta.pivotlow(swingN, swingN)
+plotshape(useSwings and not na(swPtHi), "Swing high", shape.triangleup,   location.abovebar, colSwHi, offset=-swingN, size=size.tiny, display=display.pane)
+plotshape(useSwings and not na(swPtLo), "Swing low",  shape.triangledown, location.belowbar, colSwLo, offset=-swingN, size=size.tiny, display=display.pane)
+
+
+// ── Measurement export + sample-size panel ──────────────────────────
+// These plots carry one value per raid bar and na everywhere else. They
+// render nowhere on the chart (display.data_window), but TradingView's
+// "Export chart data" writes every plot to the CSV, which is how the raid
+// readings get out of Pine and into a threshold sweep.
+
+plot(xSweepDir, "OF: sweep direction (-1 high, +1 low)", display=display.data_window)
+plot(xSweepLvl, "OF: swept level",                     display=display.data_window)
+plot(fpDelta,  "OF: bar delta",                        display=display.data_window)
+plot(plotTrig == 0 ? na : plotTrig + 0.0, "Signal (-1 short, +1 long)", display=display.data_window)
+
+
+
+
+// Both footprint accumulators are rolling windows anchored to the last bar,
+// so bars older than the longest window can never affect what is drawn.
+// Skipping them is what keeps the script from walking 20,000 bars of rows.
+bool inCalcWin = bar_index > last_bar_index - math.max(vpBars, 400) - 10
+
+// ── Volume profile from footprint rows ──────────────────────────────
+// request.footprint() only reads the current bar, so a profile spanning
+// many bars has to be accumulated as the script walks forward. Each bar's
+// rows are bucketed onto a fixed price grid and added to a running map;
+// in Rolling scope the bar leaving the window is subtracted again, which
+// keeps the work per bar proportional to one bar's row count instead of
+// the whole window.
+
+float vpStep = absTicksRow * syminfo.mintick
+
+var map<int, float>   vpMap = map.new<int, float>()
+var array<BarRows>    vpQ   = array.new<BarRows>()
+var array<line>       vpOld = array.new<line>()
+
+float vpDayChg = ta.change(time("D"))
+bool vpNewDay = vpScope == "Day" and vpDayChg != 0
+// fixed-window scope: accumulate only inside the clock window, then freeze
+bool vpInWin    = not na(time(timeframe.period, vpWin, tzNY))
+bool vpWinOpen  = vpScope == "Fixed window" and vpInWin and not vpInWin[1]
+bool vpWinClose = vpScope == "Fixed window" and not vpInWin and vpInWin[1]
+
+// point of control and value-area edges of the current map, in price
+f_vpLevels(bool active) =>
+    float poc = na
+    float vah = na
+    float val = na
+    array<int> ks = active ? vpMap.keys() : array.new_int()
+    if ks.size() > 0
+        float tot  = 0.0
+        float pocV = -1.0
+        int   pocK = 0
+        int   minK = ks.get(0)
+        int   maxK = ks.get(0)
+        for k in ks
+            float v = vpMap.get(k)
+            tot += v
+            if v > pocV
+                pocV := v
+                pocK := k
+            minK := math.min(minK, k)
+            maxK := math.max(maxK, k)
+        float target = tot * vpVaPct / 100.0
+        float acc = pocV
+        int lo = pocK
+        int hi = pocK
+        // expand outward one grid step at a time, taking the heavier side
+        while acc < target and (lo > minK or hi < maxK)
+            float vd = lo > minK and vpMap.contains(lo - 1) ? vpMap.get(lo - 1) : 0.0
+            float vu = hi < maxK and vpMap.contains(hi + 1) ? vpMap.get(hi + 1) : 0.0
+            if hi < maxK and (vu >= vd or lo <= minK)
+                hi += 1
+                acc += vu
+            else
+                lo -= 1
+                acc += vd
+        poc := pocK * vpStep
+        vah := hi * vpStep
+        val := lo * vpStep
+    [poc, vah, val]
+
+// One scan per bar at most, and only on bars that actually draw: the key
+// loop is proportional to the whole profile, unlike the accumulation above.
+[cPoc, cVah, cVal] = f_vpLevels(vpOn and (vpNewDay or vpWinClose or barstate.islast))
+
+// the frozen edges of the last completed fixed window
+var float wPoc = na
+var float wVah = na
+var float wVal = na
+if vpOn and vpWinClose
+    wPoc := cPoc
+    wVah := cVah
+    wVal := cVal
+    if vpPriorDays > 0 and not na(cPoc)
+        vpOld.push(line.new(bar_index, cPoc, bar_index + 1, cPoc, extend=extend.right, color=color.new(colPoc, 30), width=1))
+        vpOld.push(line.new(bar_index, cVah, bar_index + 1, cVah, extend=extend.right, color=color.new(colVa, 40), style=line.style_dotted))
+        vpOld.push(line.new(bar_index, cVal, bar_index + 1, cVal, extend=extend.right, color=color.new(colVa, 40), style=line.style_dotted))
+    while vpOld.size() > vpPriorDays * 3
+        line.delete(vpOld.shift())
+if vpOn and vpWinOpen
+    vpMap.clear()
+    vpQ.clear()
+
+if vpOn and fpOk and inCalcWin and (vpScope != "Fixed window" or vpInWin)
+    // a finished day leaves its levels behind before the map is cleared
+    if vpNewDay
+        if vpPriorDays > 0 and not na(cPoc)
+            vpOld.push(line.new(bar_index, cPoc, bar_index + 1, cPoc, extend=extend.right, color=color.new(colPoc, 30), width=1))
+            vpOld.push(line.new(bar_index, cVah, bar_index + 1, cVah, extend=extend.right, color=color.new(colVa, 40), style=line.style_dotted))
+            vpOld.push(line.new(bar_index, cVal, bar_index + 1, cVal, extend=extend.right, color=color.new(colVa, 40), style=line.style_dotted))
+        while vpOld.size() > vpPriorDays * 3
+            line.delete(vpOld.shift())
+        vpMap.clear()
+        vpQ.clear()
+
+    BarRows br = BarRows.new(array.new_int(), array.new_float())
+    array<volume_row> vrows = footprint.rows(fpBar)
+    for r in vrows
+        float mid = (volume_row.up_price(r) + volume_row.down_price(r)) / 2
+        int   key = int(math.round(mid / vpStep))
+        float v   = volume_row.total_volume(r)
+        br.keys.push(key)
+        br.vols.push(v)
+        vpMap.put(key, (vpMap.contains(key) ? vpMap.get(key) : 0.0) + v)
+    vpQ.push(br)
+
+    if vpScope == "Rolling bars"
+        while vpQ.size() > vpBars
+            BarRows gone = vpQ.shift()
+            for idx = 0 to gone.keys.size() - 1
+                int k = gone.keys.get(idx)
+                if vpMap.contains(k)
+                    float nv = vpMap.get(k) - gone.vols.get(idx)
+                    if nv <= 0
+                        vpMap.remove(k)
+                    else
+                        vpMap.put(k, nv)
+
+var line vpPocLn = na
+var line vpVahLn = na
+var line vpValLn = na
+
+if vpOn and barstate.islast
+    line.delete(vpPocLn)
+    line.delete(vpVahLn)
+    line.delete(vpValLn)
+    if not na(cPoc)
+        int x0 = math.max(0, bar_index - (vpScope == "Rolling bars" ? vpBars : vpQ.size()))
+        vpPocLn := line.new(x0, cPoc, bar_index + 5, cPoc, color=color.new(colPoc, 15), width=1)
+        vpVahLn := line.new(x0, cVah, bar_index + 5, cVah, color=color.new(colVa, 20), style=line.style_dashed)
+        vpValLn := line.new(x0, cVal, bar_index + 5, cVal, color=color.new(colVa, 20), style=line.style_dashed)
+
+// ── Sample-size panel ──────────────────────────
+// Placed last: it reads counters that the modules above increment.
+
+var table stat = table.new(position.bottom_right, 2, 5, border_width=1)
+f_stat(int row, string k, string v) =>
+    table.cell(stat, 0, row, k, text_color=color.white, text_size=size.small, text_halign=text.align_left,  bgcolor=color.new(color.black, 30))
+    table.cell(stat, 1, row, v, text_color=color.white, text_size=size.small, text_halign=text.align_right, bgcolor=color.new(color.black, 30))
+
+if showStats and barstate.islast
+    f_stat(0, "sweeps on arming sessions", str.tostring(cRaid))
+    f_stat(1, "armed",                    str.tostring(cArm))
+    f_stat(2, "signals long",             str.tostring(cSigL))
+    f_stat(3, "signals short",            str.tostring(cSigS))
+    f_stat(4, "signals total",            str.tostring(cSigL + cSigS))
+
+// ── Alerts ──────────────────────────────────────────────────────────
+// Notification is the alternative to drawing: leave the markers off and
+// let TradingView tell you, which costs the chart nothing.
+
+alertcondition(plotTrig == 1,  "Long entry",  "LiqSweep+iFVG: LONG signal on {{ticker}} {{interval}} at {{close}}")
+alertcondition(plotTrig == -1, "Short entry", "LiqSweep+iFVG: SHORT signal on {{ticker}} {{interval}} at {{close}}")
+alertcondition(plotTrig != 0,  "Any entry",   "LiqSweep+iFVG: entry signal on {{ticker}} {{interval}} at {{close}}")
+alertcondition(not na(xSweepDir), "Level swept", "LiqSweep+iFVG: liquidity level swept on {{ticker}} {{interval}} at {{close}}")
+
+// ── Value-area reclaim (failed auction) ─────────────────────────────
+// After the fixed window freezes its value area, a close beyond an edge that
+// is then closed back through is a failed auction: the market probed outside
+// the balance area, found nothing, and came back. Same close-back-through
+// logic the sweep trigger uses, aimed at the value-area edges.
+
+var bool vaBelow = false   // price has closed below the frozen value-area low
+var bool vaAbove = false   // price has closed above the frozen value-area high
+
+if vpOn and vpReclaim and vpScope == "Fixed window" and not na(wVal)
+    if vpWinOpen
+        vaBelow := false
+        vaAbove := false
+    if close < wVal
+        vaBelow := true
+    else if vaBelow and close > wVal
+        vaBelow := false
+        label.new(bar_index, low - labPad, "VAL reclaim", style=label.style_none,
+             textcolor=color.new(colBull, 0), size=labSz)
+    if close > wVah
+        vaAbove := true
+    else if vaAbove and close < wVah
+        vaAbove := false
+        label.new(bar_index, high + labPad, "VAH reclaim", style=label.style_none,
+             textcolor=color.new(colBear, 0), size=labSz)
+
+// ── CVD strip ───────────────────────────────────────────────────────
+// Cumulative delta rendered inside the price pane. The raw total is
+// rescaled into a band at the bottom of the visible range, so what is
+// readable is its shape and its disagreement with price, not its value.
+
+string cvdSessWin = cvdPick == "New York" ? "0930-1600" : cvdPick == "London" ? "0300-0930" : "2000-0100"
+bool cvdInSess  = not na(time(timeframe.period, cvdSessWin, tzNY))
+bool cvdNewDay  = ta.change(time("D")) != 0
+bool cvdOpen    = cvdInSess and not cvdInSess[1]
+bool cvdDoReset = cvdReset == "Day" ? cvdNewDay : cvdReset == "Session" ? cvdOpen : false
+
+var float cvdRaw = 0.0
+var int   cvdResetBar = 0
+if cvdDoReset
+    cvdRaw := 0.0
+    cvdResetBar := bar_index
+if cvdOn and fpOk
+    cvdRaw += fpDelta
+
+float cvdHi = ta.highest(cvdRaw, cvdWin)
+float cvdLo = ta.lowest(cvdRaw, cvdWin)
+float pxHi  = ta.highest(high, cvdWin)
+float pxLo  = ta.lowest(low, cvdWin)
+float band  = (pxHi - pxLo) * cvdHeight / 100.0
+float cvdBase = pxLo - (pxHi - pxLo) * cvdDrop / 100.0
+float cvdY  = cvdHi > cvdLo ? cvdBase + (cvdRaw - cvdLo) / (cvdHi - cvdLo) * band : na
+
+color cvdCol = cvdRaw >= nz(cvdRaw[1]) ? colCvdUp : colCvdDn
+pCvd  = plot(cvdOn ? cvdY : na, "CVD strip", color=cvdCol, linewidth=2)
+pBase = plot(cvdOn ? cvdBase : na, "CVD base", color=color.new(color.gray, 100), display=display.none)
+fill(pCvd, pBase, color=color.new(cvdCol, 90), title="CVD strip fill")
+
+// divergence between confirmed price swings and the delta at those swings.
+// Same pivot strength and same labels as the standalone CVD pane, so the two
+// scripts agree instead of marking different bars.
+float cvdPvHi = ta.pivothigh(high, cvdPivot, cvdPivot)
+float cvdPvLo = ta.pivotlow(low, cvdPivot, cvdPivot)
+
+var float cvdLastHiPx = na
+var float cvdLastHiCd = na
+var int   cvdLastHiBr = na
+var float cvdLastHiPxY = na
+var float cvdLastLoPx = na
+var float cvdLastLoCd = na
+var int   cvdLastLoBr = na
+var float cvdLastLoPxY = na
+
+if cvdOn and cvdDiv and not na(cvdPvHi)
+    float cdAt = cvdY[cvdPivot]
+    int   brAt = bar_index - cvdPivot
+    bool sameRunHi = brAt >= cvdResetBar and cvdLastHiBr >= cvdResetBar
+    if sameRunHi and not na(cvdLastHiPx) and cvdPvHi > cvdLastHiPx and cvdRaw[cvdPivot] < cvdLastHiCd
+        float yBear = cvdDivPlace == "On the strip" ? cdAt : high[cvdPivot] + labPad * 1.5
+        label.new(brAt, yBear, "bear div", xloc=xloc.bar_index, style=label.style_none,
+             textcolor=color.new(colCvdDn, 0), size=labSz)
+        line.new(cvdLastHiBr, cvdLastHiPxY, brAt, cdAt, color=color.new(colCvdDn, 20), width=1)
+    cvdLastHiPx := cvdPvHi
+    cvdLastHiCd := cvdRaw[cvdPivot]
+    cvdLastHiBr := brAt
+    cvdLastHiPxY := cdAt
+
+if cvdOn and cvdDiv and not na(cvdPvLo)
+    float cdAt = cvdY[cvdPivot]
+    int   brAt = bar_index - cvdPivot
+    bool sameRunLo = brAt >= cvdResetBar and cvdLastLoBr >= cvdResetBar
+    if sameRunLo and not na(cvdLastLoPx) and cvdPvLo < cvdLastLoPx and cvdRaw[cvdPivot] > cvdLastLoCd
+        float yBull = cvdDivPlace == "On the strip" ? cdAt : low[cvdPivot] - labPad * 1.5
+        label.new(brAt, yBull, "bull div", xloc=xloc.bar_index, style=label.style_none,
+             textcolor=color.new(colCvdUp, 0), size=labSz)
+        line.new(cvdLastLoBr, cvdLastLoPxY, brAt, cdAt, color=color.new(colCvdUp, 20), width=1)
+    cvdLastLoPx := cvdPvLo
+    cvdLastLoCd := cvdRaw[cvdPivot]
+    cvdLastLoBr := brAt
+    cvdLastLoPxY := cdAt
+alertcondition(vpOn and vpReclaim and vpScope == "Fixed window", "Value-area reclaim", "LiqSweep+iFVG: value-area reclaim on {{ticker}} {{interval}} at {{close}}")
