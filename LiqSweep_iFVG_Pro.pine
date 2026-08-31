@@ -40,7 +40,11 @@ indicator("LiqSweep+iFVG Pro", "LiqSweep+iFVG Pro", true, max_lines_count=500, m
 // CONTEXT
 // - Group 11 SMT divergence against a correlated market, evaluated
 //   ONLY where a tracked level is swept, comparing that market's own
-//   extreme over the same session.
+//   extreme over the same session (tracked bar-by-bar while the level
+//   lives, so an early confirmation is not mistaken for divergence).
+// - Group 09 prior day / week high, low and close as magnet lines
+//   that dim once touched; group 13 percent of a typical day's range
+//   already spent, one readout top-right.
 //
 // Alerts exist for long, short, any entry, level swept and
 // value-area reclaim, so the markers can be switched off entirely.
@@ -73,7 +77,7 @@ showRaidLabels = input.bool(true, "Show sweep markers", group=grpL, tooltip="'SW
 labSize = input.string("Normal", "Label text size", options=["Tiny", "Small", "Normal", "Large"], group=grpL, tooltip="Text size for the SWEEP / hit markers and the entry signal labels. The order-flow readout on a sweep label is two lines of numbers, so Tiny is unreadable on a large monitor.")
 sigStyle = input.string("Badge", "Entry marker style", options=["Text", "Badge"], group=grpL, tooltip="Text draws the word alone in the signal colour, with the triangle on the bar as the precise entry mark. Badge draws the older filled speech bubble, which is heavier and covers the candles behind it.")
 labSz  = labSize == "Tiny" ? size.tiny : labSize == "Small" ? size.small : labSize == "Large" ? size.large : size.normal
-liveDepth = input.int(30, "Untouched levels kept live per session type", minval=1, maxval=30, group=grpL, tooltip="1 = strict replacement: each new session's level REPLACES the previous still-live level of the same type, so only the newest untouched high/low per session type can be swept.\n\nRaise to N to keep the last N sessions' untouched levels live simultaneously, so an older pool that was never touched can still be swept days later.\n\nValues above 1 generate additional signals beyond the default model. Levels older than 'Keep drawings for N sessions' are deleted regardless, so keep that input at or above this one.")
+liveDepth = input.int(10, "Untouched levels kept live per session type", minval=1, maxval=30, group=grpL, tooltip="1 = strict replacement: each new session's level REPLACES the previous still-live level of the same type, so only the newest untouched high/low per session type can be swept.\n\nRaise to N to keep the last N sessions' untouched levels live simultaneously, so an older pool that was never touched can still be swept days later.\n\nValues above 1 generate additional signals beyond the default model. Levels older than 'Keep drawings for N sessions' are deleted regardless, so keep that input at or above this one.")
 
 grpE = "03. Sweep + trigger"
 entryMode = input.string("iFVG inversion", "Trigger after a sweep", options=["iFVG inversion", "Return through level"], group=grpE, tooltip="What converts an armed sweep into an entry signal.\n\niFVG inversion: a Fair Value Gap from the sweep leg gets BODY-closed through its far edge in the reversal direction (a wick through is rejection, not inversion).\n\nReturn through level: simpler variant - the bar closes back through the raided level itself.")
@@ -156,6 +160,16 @@ cvdDiv = input.bool(true, "Mark delta divergence against price", group=grpZ, too
 colCvdUp = input.color(#26A69A, "Rising", inline="cv", group=grpZ)
 colCvdDn = input.color(#EF5350, "Falling", inline="cv", group=grpZ)
 
+grpY = "09. Prior day & week levels"
+pdwOn = input.bool(true, "Show prior day H / L / C", group=grpY, tooltip="Yesterday's high, low and close as lines across the current day. These are the magnets a target leg aims at. A level stays bright while UNTOUCHED; the first touch dims it to dotted and tags it 'hit', so the bright ones are the draws still in play.\n\nDisplay and export only: these levels never arm a signal.")
+pwkOn = input.bool(true, "Show prior week H / L / C", group=grpY, tooltip="Last week's high, low and close, same touch-dimming. Week levels survive day rollovers until touched.")
+colPdw = input.color(#FFF176, "Prior day", inline="pw", group=grpY)
+colPww = input.color(#A1887F, "Prior week", inline="pw", group=grpY)
+
+grpR = "13. Range spent"
+adrOn = input.bool(true, "Show range spent vs typical day", group=grpR, tooltip="Today's high-to-low range so far as a percent of the average daily range over the lookback. It answers the one question nothing else on the chart speaks to: whether a reversal still has room. A day that has already spent its typical range has less to give.\n\nDrawn as one small readout in the top-right corner, plus a data-window export for measurement.")
+adrDays = input.int(10, "Average daily range lookback (days)", minval=2, maxval=60, group=grpR)
+
 grpC = "10. Colors"
 colNY = input.color(#FFB74D, "NY", inline="c", group=grpC, tooltip="Session box + level line colors per session type.")
 colLO = input.color(#64B5F6, "London", inline="c", group=grpC)
@@ -231,37 +245,45 @@ var array<line>   lvLine = array.new<line>()
 var array<string> lvTag  = array.new<string>()
 var array<int>    lvSide = array.new<int>()
 var array<bool>   lvLive = array.new<bool>()
+var array<float>  lvPx   = array.new_float()   // level price, so logic never depends on a line object existing
 var array<float>  lvCmp  = array.new_float()   // the comparison market's extreme over the same session
+var array<bool>   lvCmpBrk = array.new<bool>() // comparison market exceeded its own extreme since the level went live
 
 f_newLevel(string tag, int side, float price, color col, float cmpExt) =>
-    if showLevels
-        // replacement semantics: a new session's level retires still-live older
-        // levels of the same tag beyond the configured live depth. liveDepth=1
-        // (default) = strict replacement: newest untouched level only.
-        if lvTag.size() > 0
-            int liveCnt = 0
-            for j = lvTag.size() - 1 to 0
-                if lvTag.get(j) == tag and lvLive.get(j)
-                    liveCnt += 1
-                    if liveCnt > liveDepth - 1
-                        lvLive.set(j, false)
-        lvLine.push(line.new(time, price, time, price, xloc=xloc.bar_time, color=col, width=2))
-        lvTag.push(tag)
-        lvSide.push(side)
-        lvLive.push(true)
-        lvCmp.push(cmpExt)
-        int cnt = 0
+    // bookkeeping always runs; showLevels gates only the drawing, so hiding
+    // the lines can never switch the sweep engine off.
+    // replacement semantics: a new session's level retires still-live older
+    // levels of the same tag beyond the configured live depth. liveDepth=1
+    // = strict replacement: newest untouched level only (default 10 keeps
+    // the last ten sessions' untouched pools sweepable).
+    if lvTag.size() > 0
+        int liveCnt = 0
         for j = lvTag.size() - 1 to 0
-            if lvTag.get(j) == tag
-                cnt += 1
-                if cnt > maxDays
-                    line.delete(lvLine.get(j))
-                    lvLine.remove(j)
-                    lvTag.remove(j)
-                    lvSide.remove(j)
-                    lvLive.remove(j)
-                    lvCmp.remove(j)
-                    break
+            if lvTag.get(j) == tag and lvLive.get(j)
+                liveCnt += 1
+                if liveCnt > liveDepth - 1
+                    lvLive.set(j, false)
+    lvLine.push(showLevels ? line.new(time, price, time, price, xloc=xloc.bar_time, color=col, width=2) : line(na))
+    lvTag.push(tag)
+    lvSide.push(side)
+    lvLive.push(true)
+    lvPx.push(price)
+    lvCmp.push(cmpExt)
+    lvCmpBrk.push(false)
+    int cnt = 0
+    for j = lvTag.size() - 1 to 0
+        if lvTag.get(j) == tag
+            cnt += 1
+            if cnt > maxDays
+                line.delete(lvLine.get(j))
+                lvLine.remove(j)
+                lvTag.remove(j)
+                lvSide.remove(j)
+                lvLive.remove(j)
+                lvPx.remove(j)
+                lvCmp.remove(j)
+                lvCmpBrk.remove(j)
+                break
 
 var float nyHi = na, var float nyLo = na
 var float loHi = na, var float loLo = na
@@ -608,9 +630,18 @@ if lvLine.size() > 0
         if not lvLive.get(j)
             continue
         line ln = lvLine.get(j)
-        float price = ln.get_y1()
-        ln.set_x2(time)
+        float price = lvPx.get(j)
+        if not na(ln)
+            ln.set_x2(time)
         bool isHigh = lvSide.get(j) == 1
+        // running non-confirmation state: once the comparison market exceeds its
+        // own session extreme on ANY bar while the level is live, divergence is
+        // off the table for this level. Checked before the touch so a same-bar
+        // confirmation also counts.
+        float cmpLvl = lvCmp.get(j)
+        if smtOn and not na(cmpLvl) and not lvCmpBrk.get(j)
+            if isHigh ? smtHigh > cmpLvl : smtLow < cmpLvl
+                lvCmpBrk.set(j, true)
         bool touched = isHigh ? high >= price : low <= price
         if touched
             lvLive.set(j, false)
@@ -619,12 +650,12 @@ if lvLine.size() > 0
             bool armOk0 = str.startswith(tg0, "NY") ? armNY : str.startswith(tg0, "LO") ? armLO : armAS
             // the correlated market failed to take out its own matching extreme
             // taught version: did the comparison market take out ITS OWN extreme
-            // from the same session? Rolling is the cruder fixed-window variant.
-            float cmpLvl = lvCmp.get(j)
+            // from the same session at ANY point since it froze? Rolling is the
+            // cruder fixed-window variant.
             bool smtDiv = false
             if smtOn and raided
                 if smtRef == "Session extreme" and not na(cmpLvl)
-                    smtDiv := isHigh ? smtHigh <= cmpLvl : smtLow >= cmpLvl
+                    smtDiv := not lvCmpBrk.get(j)
                 else if smtRef == "Rolling bars"
                     smtDiv := isHigh ? smtHigh <= cmpPriorHigh : smtLow >= cmpPriorLow
             if showRaidLabels
@@ -714,7 +745,8 @@ f_dropDir(int d) =>
                 armI0.remove(j)
                 armQ.remove(j)
 
-plotTrig = 0
+bool sigLong  = false
+bool sigShort = false
 if armDir.size() > 0
     for j = armDir.size() - 1 to 0
         if time > armExp.get(j)
@@ -756,11 +788,17 @@ for s = 0 to 1
              textcolor=badge ? color.white : color.new(sigCol, inWin ? 0 : 45), size=labSz)
         f_dropDir(d)
         if inWin
-            plotTrig := d
             if d == 1
+                sigLong := true
                 cSigL += 1
             else
+                sigShort := true
                 cSigS += 1
+
+// one wide bar can trigger BOTH directions when opposite sweeps are still
+// armed; keeping the flags separate means neither plotshape, alert nor the
+// export drops one. Export encoding: +1 long, -1 short, 2 both.
+int plotTrig = sigLong and sigShort ? 2 : sigLong ? 1 : sigShort ? -1 : 0
 
 // filled gaps die: delete box + remove from logic (inversion above already ran)
 if fvgTop.size() > 0
@@ -787,8 +825,8 @@ if fvgTop.size() > 0
             fvgInvAt.remove(k)
             fvgBoxA.remove(k)
 
-plotshape(plotTrig == -1, "Signal short (enter next bar)", shape.triangledown, location.abovebar, color.red, size=size.small, display=display.pane)
-plotshape(plotTrig == 1, "Signal long (enter next bar)", shape.triangleup, location.belowbar, color.green, size=size.small, display=display.pane)
+plotshape(sigShort, "Signal short (enter next bar)", shape.triangledown, location.abovebar, color.red, size=size.small, display=display.pane)
+plotshape(sigLong, "Signal long (enter next bar)", shape.triangleup, location.belowbar, color.green, size=size.small, display=display.pane)
 bgcolor(armDir.size() > 0 ? color.new(color.yellow, 92) : na, title="Armed (level swept, waiting for trigger)")
 
 // ── Macro dealing range: premium/discount (merged from the standalone
@@ -831,7 +869,7 @@ plotshape(useSwings and not na(swPtLo), "Swing low",  shape.triangledown, locati
 plot(xSweepDir, "OF: sweep direction (-1 high, +1 low)", display=display.data_window)
 plot(xSweepLvl, "OF: swept level",                     display=display.data_window)
 plot(fpDelta,  "OF: bar delta",                        display=display.data_window)
-plot(plotTrig == 0 ? na : plotTrig + 0.0, "Signal (-1 short, +1 long)", display=display.data_window)
+plot(plotTrig == 0 ? na : plotTrig + 0.0, "Signal (-1 short, +1 long, 2 both)", display=display.data_window)
 
 
 
@@ -991,9 +1029,9 @@ if showStats and barstate.islast
 // Notification is the alternative to drawing: leave the markers off and
 // let TradingView tell you, which costs the chart nothing.
 
-alertcondition(plotTrig == 1,  "Long entry",  "LiqSweep+iFVG: LONG signal on {{ticker}} {{interval}} at {{close}}")
-alertcondition(plotTrig == -1, "Short entry", "LiqSweep+iFVG: SHORT signal on {{ticker}} {{interval}} at {{close}}")
-alertcondition(plotTrig != 0,  "Any entry",   "LiqSweep+iFVG: entry signal on {{ticker}} {{interval}} at {{close}}")
+alertcondition(sigLong,  "Long entry",  "LiqSweep+iFVG: LONG signal on {{ticker}} {{interval}} at {{close}}")
+alertcondition(sigShort, "Short entry", "LiqSweep+iFVG: SHORT signal on {{ticker}} {{interval}} at {{close}}")
+alertcondition(sigLong or sigShort, "Any entry", "LiqSweep+iFVG: entry signal on {{ticker}} {{interval}} at {{close}}")
 alertcondition(not na(xSweepDir), "Level swept", "LiqSweep+iFVG: liquidity level swept on {{ticker}} {{interval}} at {{close}}")
 
 // ── Value-area reclaim (failed auction) ─────────────────────────────
@@ -1004,21 +1042,27 @@ alertcondition(not na(xSweepDir), "Level swept", "LiqSweep+iFVG: liquidity level
 
 var bool vaBelow = false   // price has closed below the frozen value-area low
 var bool vaAbove = false   // price has closed above the frozen value-area high
+bool xVaReclaim = false    // true only on a bar that actually prints a reclaim
 
 if vpOn and vpReclaim and vpScope == "Fixed window" and not na(wVal)
-    if vpWinOpen
+    // reset at window open AND at window close: the edges change at close,
+    // and a stale flag measured against yesterday's edge would print a
+    // phantom reclaim against the brand-new one.
+    if vpWinOpen or vpWinClose
         vaBelow := false
         vaAbove := false
     if close < wVal
         vaBelow := true
     else if vaBelow and close > wVal
         vaBelow := false
+        xVaReclaim := true
         label.new(bar_index, low - labPad, "VAL reclaim", style=label.style_none,
              textcolor=color.new(colBull, 0), size=labSz)
     if close > wVah
         vaAbove := true
     else if vaAbove and close < wVah
         vaAbove := false
+        xVaReclaim := true
         label.new(bar_index, high + labPad, "VAH reclaim", style=label.style_none,
              textcolor=color.new(colBear, 0), size=labSz)
 
@@ -1096,4 +1140,77 @@ if cvdOn and cvdDiv and not na(cvdPvLo)
     cvdLastLoCd := cvdRaw[cvdPivot]
     cvdLastLoBr := brAt
     cvdLastLoPxY := cdAt
-alertcondition(vpOn and vpReclaim and vpScope == "Fixed window", "Value-area reclaim", "LiqSweep+iFVG: value-area reclaim on {{ticker}} {{interval}} at {{close}}")
+alertcondition(xVaReclaim, "Value-area reclaim", "LiqSweep+iFVG: value-area reclaim on {{ticker}} {{interval}} at {{close}}")
+
+// ── Prior day / week magnet levels (group 09) ───────────────────────
+// Prior-period values come from COMPLETED D/W bars ([1] with lookahead_on,
+// the standard non-repainting idiom), so they never move intraday. Display
+// and export only: nothing here feeds the arming logic.
+
+[pdH, pdL, pdC] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+[pwH, pwL, pwC] = request.security(syminfo.tickerid, "W", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+bool newDayBar  = ta.change(time("D")) != 0
+bool newWeekBar = ta.change(time("W")) != 0
+
+// one magnet level: line + trailing label, bright while untouched, dimmed to
+// dotted with a 'hit' tag on first touch. var state is per-call-site, so each
+// of the six calls below keeps its own line, label and touched flag.
+f_magnet(bool on, bool renew, float px, string txt, color col) =>
+    var line  ln  = na
+    var label lb  = na
+    var bool  hit = false
+    if not on
+        line.delete(ln)
+        label.delete(lb)
+        ln := line(na)
+        lb := label(na)
+    else
+        if renew and not na(px)
+            line.delete(ln)
+            label.delete(lb)
+            hit := false
+            ln := line.new(bar_index, px, bar_index + 1, px, extend=extend.right, color=color.new(col, 20), width=1)
+            lb := label.new(bar_index + 1, px, txt, style=label.style_none, textcolor=color.new(col, 10), size=size.small)
+        if not na(lb)
+            lb.set_x(bar_index + 1)
+        if not na(ln) and not hit and high >= ln.get_y1() and low <= ln.get_y1()
+            hit := true
+            ln.set_color(color.new(col, 70))
+            ln.set_style(line.style_dotted)
+            lb.set_textcolor(color.new(col, 65))
+            lb.set_text(txt + " hit")
+
+f_magnet(pdwOn, newDayBar,  pdH, "PDH", colPdw)
+f_magnet(pdwOn, newDayBar,  pdL, "PDL", colPdw)
+f_magnet(pdwOn, newDayBar,  pdC, "PDC", colPdw)
+f_magnet(pwkOn, newWeekBar, pwH, "PWH", colPww)
+f_magnet(pwkOn, newWeekBar, pwL, "PWL", colPww)
+f_magnet(pwkOn, newWeekBar, pwC, "PWC", colPww)
+
+// ── Range spent vs typical day (group 13) ───────────────────────────
+// Today's realized range against the average completed-day range: the only
+// reading on the chart that says whether a reversal still has room.
+
+float adrRef = request.security(syminfo.tickerid, "D", ta.sma(high - low, adrDays)[1], lookahead=barmerge.lookahead_on)
+
+var float dayHi = na
+var float dayLo = na
+if newDayBar
+    dayHi := high
+    dayLo := low
+else
+    dayHi := math.max(nz(dayHi, high), high)
+    dayLo := math.min(nz(dayLo, low), low)
+float rangeSpent = adrOn and adrRef > 0 ? (dayHi - dayLo) / adrRef * 100 : na
+
+var table adrTbl = table.new(position.top_right, 1, 1)
+if adrOn and barstate.islast
+    table.cell(adrTbl, 0, 0, "Range spent " + str.tostring(rangeSpent, "#") + "% of " + str.tostring(adrDays) + "d avg",
+         text_color=color.white, text_size=size.small, bgcolor=color.new(color.black, 30))
+
+plot(rangeSpent, "Range spent (% of typical day)", display=display.data_window)
+plot(pdwOn ? pdH : na, "Prior day high",  display=display.data_window)
+plot(pdwOn ? pdL : na, "Prior day low",   display=display.data_window)
+plot(pwkOn ? pwH : na, "Prior week high", display=display.data_window)
+plot(pwkOn ? pwL : na, "Prior week low",  display=display.data_window)
