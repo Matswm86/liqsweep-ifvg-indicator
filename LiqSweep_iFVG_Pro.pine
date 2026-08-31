@@ -2,27 +2,53 @@
 indicator("LiqSweep+iFVG Pro", "LiqSweep+iFVG Pro", true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
 
 // ===================================================================
-// LiqSweep+iFVG - session-liquidity raid -> inverted-FVG reversal.
+// LiqSweep+iFVG Pro - session-liquidity sweep into inverted-FVG
+// reversal, with order-flow and auction confluences layered on top.
+// Every module is toggleable; group 00's Chart density (Minimal /
+// Balanced / Full) strips the chart back without touching them.
+//
+// CORE
 // - Sessions (NY/London/Asia) tracked as liquidity; a level dies on
 //   its first touch, and a new session's level replaces the previous
 //   still-live level of the same type (configurable depth).
-// - A raid beyond a level arms a reversal for a limited window; all
-//   sessions arm by default (per-session toggles).
+// - A sweep beyond a level arms a reversal for a limited window; all
+//   sessions arm by default (per-session toggles). Group 03 can
+//   require an EXTERNAL pool to be swept before an equal high/low
+//   sweep is allowed to arm anything.
 // - Trigger: a Fair Value Gap body-closed through its far edge
-//   against the raid direction. ONE inversion clears every live
-//   same-direction arm. Pre-raid gaps within the lookback are
-//   eligible; raid-leg gaps always are.
+//   against the sweep direction. ONE inversion clears every live
+//   same-direction arm. Pre-sweep gaps within the lookback are
+//   eligible; sweep-leg gaps always are.
 // - EQH/EQL module adapted from the public "EQ & RE" concept
 //   (CantoLab). Consumed swings are pruned, active lines capped.
-// - Optional overlays: higher-TF FVG boxes (off by default), the
-//   premium/discount dealing range merged from the standalone Macro
-//   Dealing Range indicator (group 05, on by default), and Williams-
-//   fractal swing-point marks (group 06, 10 periods, on by default).
-// Runs on any timeframe; defaults are sized for MNQ on 1-minute.
+// - Overlays: higher-TF FVG boxes, the premium/discount dealing
+//   range (group 05), Williams-fractal swing marks (group 06).
+//
+// ORDER FLOW AND AUCTION (need footprint data; without it these
+// modules draw nothing and the rest is unaffected)
+// - Group 08 volume profile: point of control and value-area edges,
+//   over a rolling window, per day, or over one fixed clock window
+//   (18:00-08:55 New York default) whose edges freeze at the close
+//   of that window and carry into the session as levels.
+// - Value-area reclaim markers: a close beyond a frozen edge that is
+//   then closed back through, the failed-auction read.
+// - Group 12 cumulative volume delta, rescaled into a band inside
+//   the price pane, with divergence marked at confirmed swings. The
+//   companion LiqSweep_CVD.pine draws the same in its own pane,
+//   since one Pine script only ever gets one pane.
+//
+// CONTEXT
+// - Group 11 SMT divergence against a correlated market, evaluated
+//   ONLY where a tracked level is swept, comparing that market's own
+//   extreme over the same session.
+//
+// Alerts exist for long, short, any entry, level swept and
+// value-area reclaim, so the markers can be switched off entirely.
+// Runs on any timeframe; defaults are sized for MNQ intraday.
 // ====================================================================
 
 grpU = "00. Appearance"
-uiDensity = input.string("Balanced", "Chart density", options=["Minimal", "Balanced", "Full"], group=grpU, tooltip="One control over how much the indicator draws, so the chart can be quietened without hunting through every group.\n\nMinimal: markers and levels only. No session shading, no gap boxes, no premium/discount tint, no swing marks, no readout text.\n\nBalanced: the above plus session shading and gap boxes, with raid markers reduced to their session tag.\n\nFull: everything, including the order-flow numbers on each raid marker and the shallow-touch markers.\n\nThis can only take things away. Anything switched off in its own group stays off.")
+uiDensity = input.string("Balanced", "Chart density", options=["Minimal", "Balanced", "Full"], group=grpU, tooltip="One control over how much the indicator draws, so the chart can be quietened without hunting through every group.\n\nMinimal: markers and levels only. No session shading, no gap boxes, no premium/discount tint, no swing marks, no readout text.\n\nBalanced: the above plus session shading and gap boxes, with sweep markers reduced to their session tag.\n\nFull: everything, including the order-flow numbers on each sweep marker and the shallow-touch markers.\n\nThis can only take things away. Anything switched off in its own group stays off.")
 
 bool dMin  = uiDensity == "Minimal"
 bool dFull = uiDensity == "Full"
@@ -34,7 +60,7 @@ useLO  = input.bool(true,  "London levels", inline="2", group=grpS, tooltip="Tra
 loSess = input.session("0300-0930", "",     inline="2", group=grpS)
 useAS  = input.bool(true,  "Asia levels",   inline="3", group=grpS, tooltip="Track the Asia session's high and low as liquidity levels. 20:00-01:00 crosses midnight; that is handled.")
 asSess = input.session("2000-0100", "",     inline="3", group=grpS)
-armNY = input.bool(true,  "NY sweeps arm",     inline="a1", group=grpS, tooltip="Which sessions' levels can ARM a reversal. This is SEPARATE from tracking above: a session stays tracked (its high/low still counts as a draw-on-liquidity pool) even when its raids do not arm.\n\nAll sessions arm by default; narrow this to focus the signal on the session levels you care about.")
+armNY = input.bool(true,  "NY sweeps arm",     inline="a1", group=grpS, tooltip="Which sessions' levels can ARM a reversal. This is SEPARATE from tracking above: a session stays tracked (its high/low still counts as a draw-on-liquidity pool) even when its sweeps do not arm.\n\nAll sessions arm by default; narrow this to focus the signal on the session levels you care about.")
 armLO = input.bool(true,  "London sweeps arm", inline="a1", group=grpS)
 armAS = input.bool(true,  "Asia sweeps arm",   inline="a1", group=grpS)
 showBoxes_i = input.bool(true, "Show session boxes", group=grpS, tooltip="Shade each session as a box whose top/bottom grow with the session's high/low while it is running, then freeze. Colors follow the per-session color inputs below.")
@@ -43,16 +69,16 @@ maxDays   = input.int(90, "Keep drawings for N sessions per type", minval=1, gro
 
 grpL = "02. Levels (liquidity lines)"
 showLevels = input.bool(true, "Show level lines", group=grpL, tooltip="Each completed session leaves two horizontal lines: its high and its low. A line extends forward until its FIRST touch in ANY later session, then freezes with a label. Touched once = gone forever; it can never be a target again. A new session's level also replaces still-live older levels of the same type beyond the configured live depth below.")
-showRaidLabels = input.bool(true, "Show sweep markers", group=grpL, tooltip="'RAID <tag>' marks a take-out that armed the reversal (price traded beyond the level by at least the raid buffer). 'hit <tag>' marks a touch too shallow to arm; the level still dies.")
-labSize = input.string("Normal", "Label text size", options=["Tiny", "Small", "Normal", "Large"], group=grpL, tooltip="Text size for the RAID / hit markers and the entry signal labels. The order-flow readout on a raid label is two lines of numbers, so Tiny is unreadable on a large monitor.")
+showRaidLabels = input.bool(true, "Show sweep markers", group=grpL, tooltip="'SWEEP <tag>' marks a take-out that armed the reversal (price traded beyond the level by at least the sweep buffer). 'hit <tag>' marks a touch too shallow to arm; the level still dies.")
+labSize = input.string("Normal", "Label text size", options=["Tiny", "Small", "Normal", "Large"], group=grpL, tooltip="Text size for the SWEEP / hit markers and the entry signal labels. The order-flow readout on a sweep label is two lines of numbers, so Tiny is unreadable on a large monitor.")
 sigStyle = input.string("Badge", "Entry marker style", options=["Text", "Badge"], group=grpL, tooltip="Text draws the word alone in the signal colour, with the triangle on the bar as the precise entry mark. Badge draws the older filled speech bubble, which is heavier and covers the candles behind it.")
 labSz  = labSize == "Tiny" ? size.tiny : labSize == "Small" ? size.small : labSize == "Large" ? size.large : size.normal
-liveDepth = input.int(30, "Untouched levels kept live per session type", minval=1, maxval=30, group=grpL, tooltip="1 = strict replacement: each new session's level REPLACES the previous still-live level of the same type, so only the newest untouched high/low per session type can be raided.\n\nRaise to N to keep the last N sessions' untouched levels live simultaneously, so an older pool that was never touched can still be raided days later.\n\nValues above 1 generate additional signals beyond the default model. Levels older than 'Keep drawings for N sessions' are deleted regardless, so keep that input at or above this one.")
+liveDepth = input.int(30, "Untouched levels kept live per session type", minval=1, maxval=30, group=grpL, tooltip="1 = strict replacement: each new session's level REPLACES the previous still-live level of the same type, so only the newest untouched high/low per session type can be swept.\n\nRaise to N to keep the last N sessions' untouched levels live simultaneously, so an older pool that was never touched can still be swept days later.\n\nValues above 1 generate additional signals beyond the default model. Levels older than 'Keep drawings for N sessions' are deleted regardless, so keep that input at or above this one.")
 
-grpE = "03. Raid + trigger"
-entryMode = input.string("iFVG inversion", "Trigger after a sweep", options=["iFVG inversion", "Return through level"], group=grpE, tooltip="What converts an armed raid into an entry signal.\n\niFVG inversion: a Fair Value Gap from the raid leg gets BODY-closed through its far edge in the reversal direction (a wick through is rejection, not inversion).\n\nReturn through level: simpler variant - the bar closes back through the raided level itself.")
-sweepBufPts = input.float(0.25, "Minimum sweep beyond level (points)", minval=0, step=0.25, group=grpE, tooltip="How far past the level price must trade for the take-out to count as a raid (arm), in POINTS (1.0 = 4 MNQ ticks).")
-retTtlMin = input.int(60, "Trigger window after a sweep (minutes)", minval=1, group=grpE, tooltip="How long an armed raid stays valid. If the trigger (inversion or return) has not happened within this window, the raid is abandoned - no trade.")
+grpE = "03. Sweep + trigger"
+entryMode = input.string("iFVG inversion", "Trigger after a sweep", options=["iFVG inversion", "Return through level"], group=grpE, tooltip="What converts an armed sweep into an entry signal.\n\niFVG inversion: a Fair Value Gap from the sweep leg gets BODY-closed through its far edge in the reversal direction (a wick through is rejection, not inversion).\n\nReturn through level: simpler variant - the bar closes back through the raided level itself.")
+sweepBufPts = input.float(0.25, "Minimum sweep beyond level (points)", minval=0, step=0.25, group=grpE, tooltip="How far past the level price must trade for the take-out to count as a sweep (arm), in POINTS (1.0 = 4 MNQ ticks).")
+retTtlMin = input.int(60, "Trigger window after a sweep (minutes)", minval=1, group=grpE, tooltip="How long an armed sweep stays valid. If the trigger (inversion or return) has not happened within this window, the sweep is abandoned - no trade.")
 entryWin  = input.session("0100-1500", "Active entry window (NY tz)", group=grpE, tooltip="Signals only fire inside this window (New York time). Levels and FVGs are tracked around the clock; only the ENTRY is gated.")
 extFirst = input.bool(false, "External liquidity must be swept first", group=grpE, tooltip="Sequencing rule from the model: an EXTERNAL pool, meaning a session high or low, has to be taken out before the sweep of an INTERNAL level, an equal high or low, is allowed to arm anything.\n\nWith this off, any tracked level arms on its own sweep regardless of what came before. With it on, an equal high or low only arms when a session level was already swept in the same direction inside the window below.\n\nOnly affects equal highs and lows, since session levels are the external pools themselves.")
 extFirstBars = input.int(60, "External sweep stays valid for N bars", minval=1, group=grpE, tooltip="How long an external sweep keeps the door open for an internal one. On a 5-minute chart 60 bars is five hours.")
@@ -61,19 +87,19 @@ grpQ = "02b. Equal highs / lows (EQH-EQL)"
 useEq   = input.bool(true, "Track equal highs / lows", group=grpQ, tooltip="Adapted from the public 'EQ & RE' concept (CantoLab). A swing high is a bar whose high is the highest of the last three (1-left/1-right pivot); when a later bar comes back into a tolerance band around it, the pair is an Equal High (EQH). Same, mirrored, for lows (EQL). Equal highs/lows are resting liquidity: a cluster of stops sits just beyond them.")
 eqTolPts = input.float(1.5, "Tolerance (points)", minval=0, step=0.25, group=grpQ, tooltip="How close a later touch must come to count as EQUAL, in POINTS. 1.0 pt = 4 MNQ ticks = the source script's default. A touch further than this beyond the swing BREAKS the point instead.")
 eqMinGap = input.int(3, "Minimum bars before an equal match", minval=1, group=grpQ, tooltip="Bars that must pass after the swing forms before a touch inside the band counts as equal. Sooner than that and the point is treated as broken (swept), never marked equal. Source default: 3.")
-eqArm   = input.bool(false, "Sweeps of EQH/EQL also arm", group=grpQ, tooltip="A take-out of an equal high/low beyond the tolerance arms a reversal exactly like a session-level raid does, so the same iFVG trigger can fire on it.\n\nOFF by default: equal highs/lows fire far more often than session levels, so expect a much noisier signal. Provided for research.")
+eqArm   = input.bool(false, "Sweeps of EQH/EQL also arm", group=grpQ, tooltip="A take-out of an equal high/low beyond the tolerance arms a reversal exactly like a session-level sweep does, so the same iFVG trigger can fire on it.\n\nOFF by default: equal highs/lows fire far more often than session levels, so expect a much noisier signal. Provided for research.")
 colEq   = input.color(#EF5350, "EQH/EQL color", group=grpQ)
 
 grpF = "04. Fair Value Gaps"
 minFvgPts = input.float(1.0, "Minimum FVG size (points)", minval=0, step=0.25, group=grpF, tooltip="Gaps smaller than this are ignored entirely - not drawn, not usable for inversion. 1.0 point on MNQ = 4 ticks. Set 0 to keep every true 3-bar gap.\n\nTradeoff: with a size filter, a smaller gap can be the FIRST inversion, so the signal waits for the next gap that passes the filter and fires a few bars later. 0 removes that lateness at the cost of chart noise.")
 fvgFillRule = input.string("Body close through", "FVG fill rule (gap death)", options=["Body close through", "Wick through"], group=grpF, tooltip="When a gap counts as FILLED and is deleted from chart and logic.\n\nBody close through: a candle body closes beyond the far edge (matches the model; a filled gap can no longer invert later).\n\nWick through: any wick beyond the far edge kills it (matches the common FVG indicators, stricter).\n\nNote: the INVERSION signal itself always requires a body close, regardless of this setting.")
-fvgLookback = input.int(30, "FVGs eligible from N bars before the sweep", minval=0, group=grpF, tooltip="Only gaps formed at most this many bars before the raid (or any time after it, while armed) can invert into a signal. Keeps the inversion tied to the raid leg instead of stale gaps from hours ago.")
+fvgLookback = input.int(30, "FVGs eligible from N bars before the sweep", minval=0, group=grpF, tooltip="Only gaps formed at most this many bars before the sweep (or any time after it, while armed) can invert into a signal. Keeps the inversion tied to the sweep leg instead of stale gaps from hours ago.")
 fvgExtBars = input.int(30, "Extend live gap boxes N bars", minval=5, group=grpF, tooltip="Visual only: how far unfilled gap boxes stretch to the right of their formation bar while alive.")
 invExtBars = input.int(60, "Keep inverted gap visible N bars", minval=5, group=grpF, tooltip="After an inversion fires, the flipped gap is recolored and kept on the chart this many bars so the retest into it is visible.")
 showFvg_i = input.bool(false, "Show FVG boxes", group=grpF, tooltip="Draw every live gap that passes the size filter. Green = bullish gap (support until inverted), red = bearish. Filled gaps disappear.")
 
 grpH = "04b. Higher-timeframe FVG confluence"
-htfFvgOn = input.bool(false, "Require price inside a higher-TF FVG", group=grpH, tooltip="Location confluence: a signal only fires if price has traded inside a live higher-timeframe FVG at any point from the raid through the trigger.\n\nHigher gap timeframes filter harder: fewer signals, each backed by stronger higher-timeframe context. Off by default so the unfiltered baseline is what you see first.")
+htfFvgOn = input.bool(false, "Require price inside a higher-TF FVG", group=grpH, tooltip="Location confluence: a signal only fires if price has traded inside a live higher-timeframe FVG at any point from the sweep through the trigger.\n\nHigher gap timeframes filter harder: fewer signals, each backed by stronger higher-timeframe context. Off by default so the unfiltered baseline is what you see first.")
 htfFvgTf = input.string("240", "Gap timeframe", options=["5", "15", "60", "240", "D"], group=grpH, tooltip="Which timeframe's gaps count. Higher = stronger filter and fewer signals.")
 htfFvgShow_i = input.bool(true, "Show higher-TF gap boxes", group=grpH, tooltip="Draw each live higher-timeframe gap. Boxes disappear the bar a chart candle body closes beyond the far edge, which is the same gap-death rule the 1m gaps use.")
 colHtfFvg = input.color(color.new(color.aqua, 0), "Higher-TF gap color", inline="hc", group=grpH)
@@ -91,11 +117,11 @@ colSwHi   = input.color(#26A69A, "High", inline="sw", group=grpW)
 colSwLo   = input.color(#EF5350, "Low",  inline="sw", group=grpW)
 
 grpA = "07. Footprint data"
-absOn = input.bool(true, "Enable footprint data", group=grpA, tooltip="Measures order flow on the bar that raids a level, using TradingView's volume-footprint data.\n\nThe question it answers: when price took out the level, was the aggressive flow in the raid direction ABSORBED, or did it keep going? Absorption is the evidence that the take-out was a stop hunt rather than a breakout.\n\nRequires a TradingView Premium or Ultimate plan and a symbol with real trade data (CME_MINI:MNQ1!, not a CFD proxy). Where footprint data is missing the readings show 'n/a' and signals fire unfiltered.")
+absOn = input.bool(true, "Enable footprint data", group=grpA, tooltip="Measures order flow on the bar that sweeps a level, using TradingView's volume-footprint data.\n\nThe question it answers: when price took out the level, was the aggressive flow in the sweep direction ABSORBED, or did it keep going? Absorption is the evidence that the take-out was a stop hunt rather than a breakout.\n\nRequires a TradingView Premium or Ultimate plan and a symbol with real trade data (CME_MINI:MNQ1!, not a CFD proxy). Where footprint data is missing the readings show 'n/a' and signals fire unfiltered.")
 absTicksRow = input.int(4, "Ticks per footprint row", minval=1, group=grpA, tooltip="Price granularity of the footprint. MNQ's tick is 0.25, so 4 gives one row per index point. Lower is finer and slower.")
 absVaPct    = input.int(70, "Value area percent", minval=1, maxval=100, group=grpA, tooltip="Share of the bar's volume that defines the value area around the point of control. 70 is the convention.")
 absImbPct   = input.int(300, "Imbalance percent", minval=100, group=grpA, tooltip="A price row counts as imbalanced when one side's volume exceeds the diagonal side by this percent. 300 means a 3-to-1 dominance.")
-showStats = input.bool(false, "Show sample-size panel", group=grpA, tooltip="Counts, over the whole loaded chart, how many raids happened on an arming session, how many the order-flow filter let through, how many it blocked, and how many entry signals fired long and short. Use it to see whether a threshold sweep would have enough events to mean anything before running one.")
+showStats = input.bool(false, "Show sample-size panel", group=grpA, tooltip="Counts, over the whole loaded chart, how many sweeps happened on an arming session, how many the order-flow filter let through, how many it blocked, and how many entry signals fired long and short. Use it to see whether a threshold sweep would have enough events to mean anything before running one.")
 
 grpV = "08. Volume profile (footprint)"
 vpOn = input.bool(true, "Show volume profile levels", group=grpV, tooltip="Builds a price-by-volume profile from the footprint rows of every bar in scope and draws its point of control and value-area edges. These are the auction levels price tends to return to, so they read as draw-on-liquidity targets rather than entry signals.\n\nNeeds the same Premium or Ultimate footprint access as group 07, and reuses that group's 'Ticks per footprint row' as its price granularity.")
@@ -546,7 +572,7 @@ if useEq
         label.delete(oldEqL.lb)
         activeLows.remove(0)
 
-// ── Order-flow absorption on the raid bar (footprint) ───────────────
+// ── Order-flow absorption on the sweep bar (footprint) ───────────────
 // request.footprint() reads the CURRENT chart bar only, so every reading
 // below belongs to the bar being processed. It returns na wherever
 // footprint data is unavailable (plan, symbol, or history depth), and
@@ -556,23 +582,23 @@ fpBar = absOn or vpOn or cvdOn ? request.footprint(absTicksRow, absVaPct, absImb
 bool fpOk = not na(fpBar)
 float fpDelta = fpOk ? footprint.delta(fpBar) : na
 
-// Verdict plus raw readings for a raid on one side. isHigh=true means price
-// raided UP through a high, so the reversal being armed is a short. Kept as a
+// Verdict plus raw readings for a sweep on one side. isHigh=true means price
+// swept UP through a high, so the reversal being armed is a short. Kept as a
 // single function: the row scan and the verdict share the same locals, which
 // avoids returning a tuple into another function's scope.
 var int lvLastBar = -1   // bar the last sweep marker was drawn on
 var int lvStack   = 0    // markers already drawn on that bar
 
 // ── Export slots + counters ─────────────────────────────────────────
-// The raid readings are produced deep inside the level loop. These
+// The sweep readings are produced deep inside the level loop. These
 // bar-scoped variables lift them to the top level so they can be plotted
 // into the Data Window, which is what TradingView's "Export chart data"
 // writes to CSV. Everything here is measurement, never logic.
 
-float xSweepDir = na    // -1 = a high was raided (short arm), +1 = a low
+float xSweepDir = na    // -1 = a high was swept (short arm), +1 = a low
 float xSweepLvl = na
 
-var int cRaid  = 0     // raids on an arming session, filter aside
+var int cRaid  = 0     // sweeps on an arming session, filter aside
 var int cArm   = 0
 var int cSigL  = 0
 var int cSigS  = 0
@@ -605,7 +631,7 @@ if lvLine.size() > 0
                 // float the marker clear of the wick instead of sitting on the level:
                 // highs anchor above the bar's high, lows below its low, +/- labPad
                 float lvY = isHigh ? math.max(high, price) + labPad : math.min(low, price) - labPad
-                // several levels can be raided by one bar; step each marker
+                // several levels can be swept by one bar; step each marker
                 // further out so they stack instead of printing on top of each other
                 if bar_index != lvLastBar
                     lvLastBar := bar_index
@@ -641,9 +667,9 @@ if lvLine.size() > 0
 // Expiry pass first, then ONE inversion scan per direction. A single
 // body-closed gap clears EVERY live arm of that direction: one signal
 // per reversal context. (A per-arm scan that consumes one gap per arm
-// fires late duplicate signals when raids stack.)
+// fires late duplicate signals when sweeps stack.)
 f_fireDir(int d) =>
-    // newest same-direction armI0 anchors the pre-raid lookback window
+    // newest same-direction armI0 anchors the pre-sweep lookback window
     int newestI0 = -1
     if armDir.size() > 0
         for j = 0 to armDir.size() - 1
@@ -797,9 +823,9 @@ plotshape(useSwings and not na(swPtLo), "Swing low",  shape.triangledown, locati
 
 
 // ── Measurement export + sample-size panel ──────────────────────────
-// These plots carry one value per raid bar and na everywhere else. They
+// These plots carry one value per sweep bar and na everywhere else. They
 // render nowhere on the chart (display.data_window), but TradingView's
-// "Export chart data" writes every plot to the CSV, which is how the raid
+// "Export chart data" writes every plot to the CSV, which is how the sweep
 // readings get out of Pine and into a threshold sweep.
 
 plot(xSweepDir, "OF: sweep direction (-1 high, +1 low)", display=display.data_window)
