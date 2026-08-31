@@ -1180,6 +1180,9 @@ f_magnet(bool on, bool renew, float px, string txt, color col) =>
             ln.set_style(line.style_dotted)
             lb.set_textcolor(color.new(col, 65))
             lb.set_text(txt + " hit")
+    // explicit return so the if/else above is a statement, not the function's
+    // return expression (its two branches end in different types)
+    hit
 
 f_magnet(pdwOn, newDayBar,  pdH, "PDH", colPdw)
 f_magnet(pdwOn, newDayBar,  pdL, "PDL", colPdw)
